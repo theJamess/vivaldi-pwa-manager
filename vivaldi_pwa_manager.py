@@ -866,8 +866,12 @@ class PWAManager(Gtk.Window):
         fetch_btn = Gtk.Button.new_from_icon_name("emblem-downloads-symbolic", Gtk.IconSize.BUTTON)
         fetch_btn.set_tooltip_text("Fetch icons from a URL")
         fetch_btn.connect("clicked", lambda *_: self._fetch_icons_dialog())
+        theme_btn = Gtk.Button.new_from_icon_name("view-grid-symbolic", Gtk.IconSize.BUTTON)
+        theme_btn.set_tooltip_text("Browse installed system icons (theme names)")
+        theme_btn.connect("clicked", lambda *_: self._icon_theme_browser_dialog())
         icon_btns.pack_start(icon_btn, False, False, 0)
         icon_btns.pack_start(fetch_btn, False, False, 0)
+        icon_btns.pack_start(theme_btn, False, False, 0)
         add_row(1, "Icon", self.icon_entry, icon_btns)
 
         self.kind_combo = Gtk.ComboBoxText()
@@ -1731,6 +1735,135 @@ class PWAManager(Gtk.Window):
                 self._set_status(f"Saved icon → {dest}")
             except Exception as e:
                 self._error(f"Could not save icon: {e}")
+        dlg.destroy()
+
+    # ---- system icon-theme browser ----
+    def _icon_theme_browser_dialog(self):
+        dlg = Gtk.Dialog(title="Browse system icons", transient_for=self, modal=True)
+        dlg.set_default_size(740, 580)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        use_btn = dlg.add_button("Use selected", Gtk.ResponseType.OK)
+        use_btn.set_sensitive(False)
+
+        box = dlg.get_content_area()
+        box.set_spacing(8); box.set_margin_top(10)
+        box.set_margin_start(10); box.set_margin_end(10); box.set_margin_bottom(10)
+
+        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        search_row.pack_start(Gtk.Label(label="Search:", xalign=0), False, False, 0)
+        search_entry = Gtk.Entry(
+            placeholder_text="e.g. browser, mail, chat, vivaldi, web-, applications-")
+        search_row.pack_start(search_entry, True, True, 0)
+        size_combo = Gtk.ComboBoxText()
+        for sz, label in (("32", "32px"), ("48", "48px"),
+                          ("64", "64px"), ("96", "96px")):
+            size_combo.append(sz, label)
+        size_combo.set_active_id("48")
+        size_combo.set_tooltip_text("Thumbnail size in the grid")
+        search_row.pack_start(size_combo, False, False, 0)
+        box.pack_start(search_row, False, False, 0)
+
+        status = Gtk.Label(xalign=0)
+        status.get_style_context().add_class("dim-label")
+        box.pack_start(status, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        flow = Gtk.FlowBox()
+        flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        flow.set_max_children_per_line(8)
+        flow.set_min_children_per_line(3)
+        flow.set_homogeneous(True)
+        flow.set_valign(Gtk.Align.START)
+        sw.add(flow)
+        box.pack_start(sw, True, True, 0)
+
+        theme = Gtk.IconTheme.get_default()
+        all_names = sorted(theme.list_icons(None) or [])
+
+        state = {"selected": None, "debounce_id": 0}
+
+        def populate():
+            state["debounce_id"] = 0
+            for child in flow.get_children():
+                flow.remove(child)
+            state["selected"] = None
+            use_btn.set_sensitive(False)
+            q = search_entry.get_text().strip().lower()
+            if not q:
+                status.set_text(
+                    f"{len(all_names)} icons in /usr/share/icons + "
+                    "~/.local/share/icons. Type to search."
+                )
+                return False
+            try:
+                sz = int(size_combo.get_active_id() or "48")
+            except ValueError:
+                sz = 48
+            matches = [n for n in all_names if q in n.lower()]
+            cap = 240
+            shown = matches[:cap]
+            for name in shown:
+                info = theme.lookup_icon(name, sz, 0)
+                if not info:
+                    continue
+                try:
+                    pix = info.load_icon()
+                    if pix.get_width() != sz or pix.get_height() != sz:
+                        pix = pix.scale_simple(sz, sz, GdkPixbuf.InterpType.BILINEAR)
+                except Exception:
+                    continue
+                tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                tile.set_margin_top(4); tile.set_margin_bottom(4)
+                tile.pack_start(Gtk.Image.new_from_pixbuf(pix), False, False, 0)
+                lbl = Gtk.Label(label=name, xalign=0.5)
+                lbl.set_max_width_chars(18)
+                lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
+                lbl.get_style_context().add_class("dim-label")
+                tile.pack_start(lbl, False, False, 0)
+                tile._icon_name = name
+                tile.set_tooltip_text(name)
+                flow.add(tile)
+            flow.show_all()
+            cap_note = f" (capped at {cap})" if len(matches) > cap else ""
+            status.set_text(
+                f"{len(matches)} match(es){cap_note}." if matches
+                else "No matches."
+            )
+            return False  # one-shot timeout
+
+        def schedule_search(*_):
+            if state["debounce_id"]:
+                GLib.source_remove(state["debounce_id"])
+            state["debounce_id"] = GLib.timeout_add(180, populate)
+
+        def on_selection(fbox):
+            children = fbox.get_selected_children()
+            if not children:
+                state["selected"] = None
+                use_btn.set_sensitive(False)
+                return
+            tile = children[0].get_child()
+            state["selected"] = getattr(tile, "_icon_name", None)
+            use_btn.set_sensitive(state["selected"] is not None)
+
+        search_entry.connect("changed", schedule_search)
+        size_combo.connect("changed", schedule_search)
+        flow.connect("selected-children-changed", on_selection)
+        flow.connect("child-activated", lambda *_: dlg.response(Gtk.ResponseType.OK))
+
+        # Prefill search with the current Icon entry if it looks like a name
+        current = self.icon_entry.get_text().strip()
+        if current and not os.path.isabs(current):
+            search_entry.set_text(current)
+        else:
+            populate()  # show the "type to search" hint
+
+        dlg.show_all()
+        resp = dlg.run()
+        if resp == Gtk.ResponseType.OK and state["selected"]:
+            self.icon_entry.set_text(state["selected"])
+            self._set_status(f"Icon set to '{state['selected']}'")
         dlg.destroy()
 
     # ---- actions ----

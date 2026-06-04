@@ -78,6 +78,7 @@ No build step, no virtualenv, nothing to compile. It's one Python file.
   After install, hit Refresh and the new PWA shows up here. The dialog also has direct *Sandboxed window* / *Web App* options for cases where you don't need Vivaldi's PWA registry.
 - **ⓘ** in the header bar: the flag reference dialog.
 - **Fetch icons…** (download glyph next to the Icon field): scrapes `<link rel=icon>`, `<link rel=apple-touch-icon>`, `<meta property=og:image>`, and any linked web manifest's `icons[]` from a URL you supply. Defaults to the launcher's URL but you can point it elsewhere — e.g. if your Portainer launcher targets `10.0.1.77:9443` (which has no icons of its own), point this at `portainer.io` instead. Self-signed TLS errors are opt-in via a checkbox. Picked icons land in `~/.local/share/vivaldi-pwa-icons/`.
+- **Browse system icons** (grid glyph next to the Icon field): searchable browser over every theme name installed under `/usr/share/icons` and `~/.local/share/icons`. Type a query, click a thumbnail, *Use selected* — the Icon field gets set to the theme name (e.g. `web-rumble`, `applications-internet`) so it respects whatever icon theme the user has active later. ~5k icons on a Mint default install; results are capped at 240 per search.
 - **Duplicate**: clones the selected launcher to `<stem>-copy.desktop` with `(copy)` appended to Name. Good starting point for "I want a second one of this signed in to a different account."
 - **Forget orphan…** (only when an orphan is selected): deletes Vivaldi's cached icon dir for that PWA so it stops showing up in our list. Does *not* fully uninstall the PWA from Vivaldi — use **Open vivaldi://apps** for the proper uninstall path.
 
@@ -118,6 +119,46 @@ Check **Isolated profile** in the *Profile & Privacy* expander, hit Save. You ge
 Each isolated launcher carves out its own Chromium profile (~50–150 MB), with independent cookies, extensions, bookmarks, the works. Run two of the same web app signed in to different accounts and they'll never see each other.
 
 The profile directory is created on Save, but *only* if it sits inside `~/.local/share/vivaldi-pwa-profiles/`. The tool won't reach into arbitrary user-typed paths and `mkdir -p` them.
+
+## Recipes
+
+### A single "socials" window with 5–6 tabs of your choosing
+
+The shape you want is a *Sandboxed window*: one Vivaldi window with tabs + address bar, isolated profile, own taskbar identity. The wrinkle is making the same 5–6 tabs reopen every time.
+
+Two-step setup:
+
+1. **+ → Sandboxed window** → Name: `Socials`, URL: the first site you'd open (anything — it's just the seed tab). Save. Launch once; you get a single tab.
+2. In *that* Vivaldi window, open `vivaldi://settings/startup` → **Startup with → Specific pages** → paste all six URLs. Close, relaunch. The window now opens with all six tabs.
+
+Layer on top:
+
+- **Pin the tabs** (right-click → *Pin Tab*) so they show as favicon-only tabs at the left, can't be accidentally closed, and reopen on launch even without the startup-pages setting.
+- **Workspaces inside the window** — Vivaldi's *Workspaces* feature lets you group tabs into named workspaces (e.g. *DMs* / *feeds* / *news*). Right-click a tab → *Move Tab to Workspace*. Switching workspaces filters the tab strip.
+- **Per-profile extensions** — install Dark Reader, a content-blocker, Tampermonkey only in this profile. They're isolated and don't touch your main Vivaldi.
+- **Distinct alt-tab icon** — tick *Override alt-tab icon* in the Window expander and use **Browse system icons** to pick something like `applications-internet` or whatever fits the vibe.
+
+There's a quicker but quirkier path: instead of step 2, edit the launcher's Exec to include all six URLs as positional args:
+
+```
+vivaldi-stable --user-data-dir=… --class=Socials --no-first-run \
+  https://x.com https://reddit.com https://news.ycombinator.com \
+  https://bsky.app https://threads.net https://mastodon.social
+```
+
+This works on cold launch (no existing Socials window), but if the window is *already open* and you click the launcher again, Chromium opens those URLs as *additional* tabs in the existing window — you'll keep accumulating duplicates. The startup-pages approach plays nicely with the singleton.
+
+### Two of the same web app with different logins (two Slacks, two Gmails, …)
+
+1. + → *Sandboxed window* → Name + URL of the app, Save.
+2. **Duplicate** the launcher → rename copy to e.g. `Slack (Personal)` and adjust the WM Class so it lands as a separate pinned app.
+3. Save the duplicate. Each gets its own isolated profile dir under `~/.local/share/vivaldi-pwa-profiles/`, so cookies/logins don't cross-contaminate.
+
+### Self-hosted lab service that's behind a self-signed cert
+
+The proper fix is to put it behind your reverse proxy with a real cert (Let's Encrypt via SWAG / Caddy / Traefik / …) and access it via that subdomain. PWAs will *just work* — no flags, no cert imports, no shutdown-on-continue when you click through the warning page.
+
+If you have to access raw IP for some reason, add `--ignore-certificate-errors --test-type` to *Extra flags* — but with the gotcha that this only works if Vivaldi *isn't already running* (singleton IPC discards the new launch's flags). Trusting the cert in `vivaldi://certificate-manager` is the only thing that survives the singleton.
 
 ## What it writes
 
