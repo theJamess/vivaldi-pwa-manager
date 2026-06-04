@@ -799,6 +799,47 @@ def render_recolored_svg(svg_path: str, target_hex: str, size: int):
         return None
 
 
+def recolor_raster_pixbuf(src_pix, rgba, target_size=None):
+    """Tint a raster (PNG/JPG/…) pixbuf with `rgba`, modulated by the source
+    pixel's luminance so bright areas stay bright and dark areas stay dark.
+    Preserves alpha. Heavier than load_symbolic / SVG-recolour (per-pixel
+    Python loop), so use for preview + save, not for grid bulk-rendering."""
+    if src_pix.get_n_channels() != 4:
+        src_pix = src_pix.add_alpha(False, 0, 0, 0)
+    if target_size and (
+        src_pix.get_width() != target_size or src_pix.get_height() != target_size
+    ):
+        src_pix = src_pix.scale_simple(
+            target_size, target_size, GdkPixbuf.InterpType.BILINEAR
+        )
+    w, h = src_pix.get_width(), src_pix.get_height()
+    stride = src_pix.get_rowstride()
+    raw = src_pix.get_pixels()
+    tr = int(rgba.red * 255)
+    tg = int(rgba.green * 255)
+    tb = int(rgba.blue * 255)
+    out = bytearray(raw)
+    row_len = w * 4
+    for y in range(h):
+        base = y * stride
+        for x in range(0, row_len, 4):
+            i = base + x
+            a = out[i + 3]
+            if a == 0:
+                continue
+            r, g, b = out[i], out[i + 1], out[i + 2]
+            # Rec. 601 luminance, integer math
+            lum = (299 * r + 587 * g + 114 * b) // 1000
+            out[i] = (tr * lum) // 255
+            out[i + 1] = (tg * lum) // 255
+            out[i + 2] = (tb * lum) // 255
+    return GdkPixbuf.Pixbuf.new_from_bytes(
+        GLib.Bytes.new(bytes(out)),
+        GdkPixbuf.Colorspace.RGB,
+        True, 8, w, h, stride,
+    )
+
+
 def rgba_to_hex(rgba) -> str:
     return (
         f"#{int(rgba.red * 255):02x}"
@@ -854,7 +895,26 @@ def save_tinted_icon(icon_name: str, icon_info, rgba) -> str:
             return str(dest)
         except Exception:
             return ""
-    return ""
+
+    # Raster theme icon — load native, recolour, save as PNG
+    try:
+        native = icon_info.load_icon()
+    except Exception:
+        return ""
+    try:
+        tinted = recolor_raster_pixbuf(native, rgba)
+    except Exception:
+        return ""
+    dest = FETCHED_ICONS_DIR / f"{slug}-{color_token}.png"
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = FETCHED_ICONS_DIR / f"{slug}-{color_token}-{n}.png"
+    try:
+        tinted.savev(str(dest), "png", [], [])
+        return str(dest)
+    except Exception:
+        return ""
 
 
 def enumerate_icon_folders(max_depth=5):
@@ -2345,6 +2405,17 @@ class PWAManager(Gtk.Window):
             info = state["selected_info"]
             return bool(info and info.is_symbolic())
 
+        def selected_is_raster():
+            """Selected icon is a raster (PNG/JPG/XPM) — tintable via the
+            heavier per-pixel recolour."""
+            if state["selected_kind"] == "theme" and state["selected_info"]:
+                fn = state["selected_info"].get_filename() or ""
+                return fn.lower().endswith((".png", ".jpg", ".jpeg", ".xpm"))
+            elif state["selected_kind"] == "file":
+                p = state["selected_value"] or ""
+                return p.lower().endswith((".png", ".jpg", ".jpeg", ".xpm"))
+            return False
+
         def update_preview():
             kind = state["selected_kind"]
             if not kind:
@@ -2359,39 +2430,52 @@ class PWAManager(Gtk.Window):
                 return
             symbolic = selected_is_symbolic()
             recolorable_svg = bool(selected_source_svg_path())
-            tintable = symbolic or recolorable_svg
+            raster = selected_is_raster()
+            tintable = symbolic or recolorable_svg or raster
             for w in (color_btn, color_lbl):
                 w.set_sensitive(tintable)
             color_clear.set_sensitive(tintable and state["color"] is not None)
 
             pix = None
             color = state["color"] if tintable else None
-            if symbolic and color is not None:
-                try:
-                    pix, _ = state["selected_info"].load_symbolic(color)
-                except Exception:
-                    pix = None
-            elif recolorable_svg and color is not None:
-                pix = render_recolored_svg(
-                    selected_source_svg_path(), rgba_to_hex(color), 96)
-            if pix is None:
-                # Native render
-                if kind == "theme":
-                    info = state["selected_info"]
-                    if info:
-                        try:
-                            pix = info.load_icon()
-                            if pix.get_width() != 96 or pix.get_height() != 96:
-                                pix = pix.scale_simple(
-                                    96, 96, GdkPixbuf.InterpType.BILINEAR)
-                        except Exception:
-                            pix = None
-                else:
+            # Always render the native source first; we'll overwrite below
+            # if a tint applies (and worked).
+            native_pix = None
+            if kind == "theme":
+                info = state["selected_info"]
+                if info:
                     try:
-                        pix = GdkPixbuf.Pixbuf.new_from_file_at_size(
-                            state["selected_value"], 96, 96)
+                        native_pix = info.load_icon()
+                    except Exception:
+                        native_pix = None
+            else:
+                try:
+                    native_pix = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                        state["selected_value"], 96, 96)
+                except Exception:
+                    native_pix = None
+
+            if color is not None:
+                if symbolic:
+                    try:
+                        pix, _ = state["selected_info"].load_symbolic(color)
                     except Exception:
                         pix = None
+                elif recolorable_svg:
+                    pix = render_recolored_svg(
+                        selected_source_svg_path(), rgba_to_hex(color), 96)
+                elif raster and native_pix is not None:
+                    try:
+                        pix = recolor_raster_pixbuf(native_pix, color, 96)
+                    except Exception:
+                        pix = None
+            if pix is None:
+                pix = native_pix
+
+            if pix is not None and (
+                pix.get_width() != 96 or pix.get_height() != 96
+            ):
+                pix = pix.scale_simple(96, 96, GdkPixbuf.InterpType.BILINEAR)
             if pix:
                 preview_img.set_from_pixbuf(pix)
             else:
@@ -2405,9 +2489,14 @@ class PWAManager(Gtk.Window):
                 preview_note.set_text(
                     "SVG — best-effort tint (multi-colour icons may keep some "
                     "of their original fills).")
+            elif raster:
+                preview_note.set_text(
+                    "Raster icon — luminance-preserving tint applied on "
+                    "preview and on save. Grid keeps native colours (perf)."
+                )
             else:
                 preview_note.set_text(
-                    "Raster icon — tint not supported.")
+                    "Tint not supported for this icon type.")
 
         # --- Handlers ---
         def schedule_search(*_):
@@ -2572,18 +2661,17 @@ class PWAManager(Gtk.Window):
                     info = state["selected_info"] or theme.lookup_icon(value, 256, 0)
                     tinted_path = save_tinted_icon(value, info, color)
                 else:
-                    # File-mode: build a pseudo IconInfo-like for save_tinted_icon
-                    # by writing a temporary symlink? simpler: handle file SVG recolor
-                    # inline.
+                    # File-mode (browsed via Folders): SVG → text recolor,
+                    # raster → per-pixel recolour. Either way save into the
+                    # managed fetched-icons dir.
+                    slug = re.sub(r"[^A-Za-z0-9_-]+", "-",
+                                  Path(value).stem).strip("-").lower() or "icon"
+                    hex_token = rgba_to_hex(color).lstrip("#")
+                    FETCHED_ICONS_DIR.mkdir(parents=True, exist_ok=True)
                     if value.lower().endswith(".svg"):
                         try:
                             src = Path(value).read_text()
                             colored = recolor_svg_text(src, rgba_to_hex(color))
-                            slug = re.sub(r"[^A-Za-z0-9_-]+", "-",
-                                          Path(value).stem).strip("-").lower() \
-                                          or "icon"
-                            hex_token = rgba_to_hex(color).lstrip("#")
-                            FETCHED_ICONS_DIR.mkdir(parents=True, exist_ok=True)
                             dest = FETCHED_ICONS_DIR / f"{slug}-{hex_token}.svg"
                             n = 1
                             while dest.exists():
@@ -2591,6 +2679,20 @@ class PWAManager(Gtk.Window):
                                 dest = FETCHED_ICONS_DIR / \
                                     f"{slug}-{hex_token}-{n}.svg"
                             dest.write_text(colored)
+                            tinted_path = str(dest)
+                        except Exception:
+                            tinted_path = ""
+                    else:
+                        try:
+                            native = GdkPixbuf.Pixbuf.new_from_file(value)
+                            tinted = recolor_raster_pixbuf(native, color)
+                            dest = FETCHED_ICONS_DIR / f"{slug}-{hex_token}.png"
+                            n = 1
+                            while dest.exists():
+                                n += 1
+                                dest = FETCHED_ICONS_DIR / \
+                                    f"{slug}-{hex_token}-{n}.png"
+                            tinted.savev(str(dest), "png", [], [])
                             tinted_path = str(dest)
                         except Exception:
                             tinted_path = ""
