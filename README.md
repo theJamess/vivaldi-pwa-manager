@@ -71,7 +71,11 @@ No build step, no virtualenv, nothing to compile. It's one Python file.
 - **Left pane**: every Vivaldi launcher it found, plus orphan PWAs at the bottom. Single-click to inspect, double-click (or *Launch*) to open.
 - **Right pane**: editor. Change anything, hit *Save*.
 - **Kind dropdown**: switching it rewrites the underlying `Exec` line in place, preserving URL/app-id from the form. So you can take an existing chromeless PWA, flip it to *Sandboxed window*, and have a tabbed version pinned alongside.
-- **+** in the header bar: opens the *New launcher* dialog. The default is **Install via Vivaldi** — Vivaldi handles real PWAs better than anything we can fake (manifest, extensions, per-app settings), so the manager just opens the URL in Vivaldi and points you at *Menu → Install Page as Web App*. After install, hit Refresh and the new PWA shows up here. The dialog also has direct *Sandboxed window* / *Web App* options for cases where you don't need Vivaldi's PWA registry.
+- **+** in the header bar: opens the *New launcher* dialog. The default is **Install via Vivaldi** — Vivaldi handles real PWAs better than anything we can fake (manifest, extensions, per-app settings), so the manager just opens the URL in Vivaldi and you finish the install from there. Once Vivaldi has the page open, **right-click the tab → Progressive Web Apps → Install page as app…**:
+
+  ![Right-click tab → Progressive Web Apps → Install page as app…](docs/install-via-vivaldi.png)
+
+  After install, hit Refresh and the new PWA shows up here. The dialog also has direct *Sandboxed window* / *Web App* options for cases where you don't need Vivaldi's PWA registry.
 - **ⓘ** in the header bar: the flag reference dialog.
 - **Fetch icons…** (download glyph next to the Icon field): scrapes `<link rel=icon>`, `<link rel=apple-touch-icon>`, `<meta property=og:image>`, and any linked web manifest's `icons[]` from a URL you supply. Defaults to the launcher's URL but you can point it elsewhere — e.g. if your Portainer launcher targets `10.0.1.77:9443` (which has no icons of its own), point this at `portainer.io` instead. Self-signed TLS errors are opt-in via a checkbox. Picked icons land in `~/.local/share/vivaldi-pwa-icons/`.
 - **Duplicate**: clones the selected launcher to `<stem>-copy.desktop` with `(copy)` appended to Name. Good starting point for "I want a second one of this signed in to a different account."

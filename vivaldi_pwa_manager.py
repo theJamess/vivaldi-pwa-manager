@@ -29,8 +29,9 @@ from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gtk, GdkPixbuf, GLib  # noqa: E402
+from gi.repository import Gdk, Gtk, GdkPixbuf, GLib  # noqa: E402
 
 APPS_DIR = Path.home() / ".local/share/applications"
 VIVALDI_PROFILE = Path.home() / ".config/vivaldi/Default"
@@ -40,6 +41,9 @@ ISOLATED_PROFILES_ROOT = Path.home() / ".local/share/vivaldi-pwa-profiles"
 WRAPPER_NAME = "vivaldi-pwa-icon-wrap"
 WRAPPER_INSTALL_DIR = Path.home() / ".local/bin"
 WRAPPER_SOURCE = Path(__file__).resolve().parent / WRAPPER_NAME
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+INSTALL_SCREENSHOT = SCRIPT_DIR / "docs" / "install-via-vivaldi.png"
 
 FETCHED_ICONS_DIR = Path.home() / ".local/share/vivaldi-pwa-icons"
 HTTP_TIMEOUT = 10
@@ -767,7 +771,16 @@ class PWAManager(Gtk.Window):
         self.orphans = []
         self.current = None
         self._build_ui()
+        self._install_accels()
         self.refresh()
+
+    def _install_accels(self):
+        accel = Gtk.AccelGroup()
+        self.add_accel_group(accel)
+        accel.connect(
+            Gdk.KEY_q, Gdk.ModifierType.CONTROL_MASK,
+            Gtk.AccelFlags.VISIBLE, lambda *_: self.close() or True,
+        )
 
     # ---- layout ----
     def _build_ui(self):
@@ -1361,21 +1374,34 @@ class PWAManager(Gtk.Window):
         note.get_style_context().add_class("dim-label")
         box.pack_start(note, False, False, 0)
 
+        # Screenshot showing the right-click → Progressive Web Apps menu path.
+        # Only visible when "Install via Vivaldi" is the selected kind.
+        screenshot_img = Gtk.Image()
+        if INSTALL_SCREENSHOT.is_file():
+            try:
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                    str(INSTALL_SCREENSHOT), 560, 320
+                )
+                screenshot_img.set_from_pixbuf(pix)
+                screenshot_img.set_margin_top(6)
+            except Exception:
+                pass
+        box.pack_start(screenshot_img, False, False, 0)
+
         def update_for_kind(*_):
             k = kind_combo.get_active_id()
-            if k == "vivaldi-install":
+            is_install = k == "vivaldi-install"
+            if is_install:
                 note.set_text(
-                    "Opens the URL in Vivaldi. From there, use "
-                    "Menu → Install Page as Web App (or the install icon in "
-                    "the address bar). Vivaldi handles the manifest, icons, "
-                    "extensions, and per-app settings. After installing, "
-                    "click Refresh in this manager and the new PWA shows up."
+                    "Opens Vivaldi (with the URL if you provide one, "
+                    "otherwise just Vivaldi — pick a bookmark, paste a URL, "
+                    "whatever). Then right-click the tab → Progressive Web "
+                    "Apps → Install page as app… Vivaldi handles the "
+                    "manifest, icons, extensions, and per-app settings. "
+                    "After installing, click Refresh in this manager and "
+                    "the new PWA shows up."
                 )
                 ok_btn.set_label("Open in Vivaldi")
-                for w in (name_e, icon_e):
-                    w.set_sensitive(False)
-                labels["Name"].set_sensitive(False)
-                labels["Icon"].set_sensitive(False)
             elif k == "sandboxed":
                 note.set_text(
                     "Sandboxed: full Vivaldi window (tabs + address bar) with "
@@ -1383,10 +1409,6 @@ class PWAManager(Gtk.Window):
                     "separate app in the taskbar."
                 )
                 ok_btn.set_label("Create")
-                for w in (name_e, icon_e):
-                    w.set_sensitive(True)
-                labels["Name"].set_sensitive(True)
-                labels["Icon"].set_sensitive(True)
             else:
                 note.set_text(
                     "Web App: chromeless --app=URL window. No tabs, no "
@@ -1394,15 +1416,17 @@ class PWAManager(Gtk.Window):
                     "touching Vivaldi."
                 )
                 ok_btn.set_label("Create")
-                for w in (name_e, icon_e):
-                    w.set_sensitive(True)
-                labels["Name"].set_sensitive(True)
-                labels["Icon"].set_sensitive(True)
+            for w in (name_e, icon_e):
+                w.set_sensitive(not is_install)
+            labels["Name"].set_sensitive(not is_install)
+            labels["Icon"].set_sensitive(not is_install)
+            screenshot_img.set_visible(is_install and screenshot_img.get_pixbuf() is not None)
 
-        update_for_kind()
         kind_combo.connect("changed", update_for_kind)
 
         dlg.show_all()
+        # Apply initial state AFTER show_all so set_visible(False) takes effect
+        update_for_kind()
         if dlg.run() == Gtk.ResponseType.OK:
             kind = kind_combo.get_active_id() or "sandboxed"
             name = name_e.get_text().strip()
@@ -1410,13 +1434,11 @@ class PWAManager(Gtk.Window):
             icon = icon_e.get_text().strip()
             dlg.destroy()
             if kind == "vivaldi-install":
-                if not url:
-                    self._error("URL is required.")
-                    return
-                if not url.startswith(("http://", "https://")):
+                if url and not url.startswith(("http://", "https://")):
                     url = "https://" + url
+                cmd = [DEFAULT_BINARY] + ([url] if url else [])
                 try:
-                    subprocess.Popen([DEFAULT_BINARY, url], start_new_session=True)
+                    subprocess.Popen(cmd, start_new_session=True)
                 except Exception as e:
                     self._error(f"Couldn't open Vivaldi: {e}")
                     return
@@ -1426,8 +1448,8 @@ class PWAManager(Gtk.Window):
                     text="Install this page as a PWA in Vivaldi",
                 )
                 info.format_secondary_text(
-                    "Use Vivaldi's Menu → Install Page as Web App, or click "
-                    "the install icon in the address bar.\n\n"
+                    "Right-click the tab → Progressive Web Apps → "
+                    "Install page as app…\n\n"
                     "Once installed, click Refresh in this manager and the "
                     "new PWA will show up (as a launcher or an orphan you "
                     "can promote)."
