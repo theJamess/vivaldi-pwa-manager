@@ -1960,7 +1960,6 @@ class PWAManager(Gtk.Window):
 
         # --- Browse-by toggle (Categories | Folders) ---
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        mode_row.set_no_show_all(True)
         mode_row.pack_start(Gtk.Label(label="Browse by:", xalign=0),
                             False, False, 0)
         rb_cat = Gtk.RadioButton.new_with_label_from_widget(None, "Categories")
@@ -2045,25 +2044,56 @@ class PWAManager(Gtk.Window):
         }
 
         # --- Tile factories ---
-        def make_theme_icon_tile(name, sz):
+        def _tinted_theme_pix(info, sz, color):
+            """Try to render a theme icon tinted with `color`. Returns Pixbuf
+            or None to mean 'fall back to native render'."""
+            if color is None or not info:
+                return None
+            if info.is_symbolic():
+                try:
+                    pix, _ = info.load_symbolic(color)
+                    if pix and (pix.get_width() != sz or pix.get_height() != sz):
+                        pix = pix.scale_simple(
+                            sz, sz, GdkPixbuf.InterpType.BILINEAR)
+                    return pix
+                except Exception:
+                    return None
+            fn = info.get_filename() or ""
+            if fn.lower().endswith(".svg"):
+                return render_recolored_svg(fn, rgba_to_hex(color), sz)
+            return None
+
+        def _tinted_file_pix(path, sz, color):
+            if color is None or not path:
+                return None
+            if path.lower().endswith(".svg"):
+                return render_recolored_svg(path, rgba_to_hex(color), sz)
+            return None
+
+        def make_theme_icon_tile(name, sz, color=None):
             info = theme.lookup_icon(name, sz, 0)
             if not info:
                 return None
-            try:
-                pix = info.load_icon()
-                if pix.get_width() != sz or pix.get_height() != sz:
-                    pix = pix.scale_simple(sz, sz, GdkPixbuf.InterpType.BILINEAR)
-            except Exception:
-                return None
+            pix = _tinted_theme_pix(info, sz, color)
+            if pix is None:
+                try:
+                    pix = info.load_icon()
+                    if pix.get_width() != sz or pix.get_height() != sz:
+                        pix = pix.scale_simple(
+                            sz, sz, GdkPixbuf.InterpType.BILINEAR)
+                except Exception:
+                    return None
             tile = _make_tile(Gtk.Image.new_from_pixbuf(pix), name)
             tile._kind = "theme"; tile._value = name
             return tile
 
-        def make_file_icon_tile(path, sz):
-            try:
-                pix = GdkPixbuf.Pixbuf.new_from_file_at_size(path, sz, sz)
-            except Exception:
-                return None
+        def make_file_icon_tile(path, sz, color=None):
+            pix = _tinted_file_pix(path, sz, color)
+            if pix is None:
+                try:
+                    pix = GdkPixbuf.Pixbuf.new_from_file_at_size(path, sz, sz)
+                except Exception:
+                    return None
             tile = _make_tile(Gtk.Image.new_from_pixbuf(pix),
                               os.path.basename(path))
             tile._kind = "file"; tile._value = path
@@ -2179,6 +2209,8 @@ class PWAManager(Gtk.Window):
             except ValueError:
                 sz = 48
 
+            tint_note = (f"  ·  tinted {rgba_to_hex(state['color'])}"
+                         if state["color"] is not None else "")
             if state["folder"]:
                 files = list_icon_files_in_folder(state["folder"])
                 matches = [
@@ -2187,7 +2219,7 @@ class PWAManager(Gtk.Window):
                 ]
                 cap = 240
                 for path in matches[:cap]:
-                    tile = make_file_icon_tile(path, sz)
+                    tile = make_file_icon_tile(path, sz, color=state["color"])
                     if tile is not None:
                         flow.add(tile)
                 cap_note = f" (showing first {cap})" if len(matches) > cap else ""
@@ -2197,14 +2229,15 @@ class PWAManager(Gtk.Window):
                         else f"No image files in {state['folder']}.")
                 else:
                     status.set_text(
-                        f"{len(matches)} file(s) in {state['folder']}{cap_note}.")
+                        f"{len(matches)} file(s) in {state['folder']}"
+                        f"{cap_note}{tint_note}.")
             else:
                 cat = state["category"]
                 source = ctx_names.get(cat, all_names) if cat else all_names
                 matches = [n for n in source if q in n.lower()] if q else source
                 cap = 240
                 for name in matches[:cap]:
-                    tile = make_theme_icon_tile(name, sz)
+                    tile = make_theme_icon_tile(name, sz, color=state["color"])
                     if tile is not None:
                         flow.add(tile)
                 cap_note = f" (showing first {cap})" if len(matches) > cap else ""
@@ -2213,10 +2246,11 @@ class PWAManager(Gtk.Window):
                     status.set_text(f"No icons match '{q}'{scope}.")
                 elif q:
                     status.set_text(
-                        f"{len(matches)} match(es) for '{q}'{scope}{cap_note}.")
+                        f"{len(matches)} match(es) for '{q}'{scope}"
+                        f"{cap_note}{tint_note}.")
                 else:
                     status.set_text(
-                        f"All icons in {cat}: {len(matches)}{cap_note}.")
+                        f"All icons in {cat}: {len(matches)}{cap_note}{tint_note}.")
             flow.show_all()
             return False
 
@@ -2370,10 +2404,14 @@ class PWAManager(Gtk.Window):
         def on_color_set(_btn):
             state["color"] = color_btn.get_rgba()
             update_preview()
+            # Re-render the grid so the user sees every tintable icon in the
+            # chosen colour while browsing — not just the preview pane.
+            populate()
 
         def on_color_clear(_btn):
             state["color"] = None
             update_preview()
+            populate()
 
         search_entry.connect("changed", schedule_search)
         size_combo.connect("changed", schedule_search)
@@ -2392,8 +2430,11 @@ class PWAManager(Gtk.Window):
             populate()
 
         dlg.show_all()
-        mode_row.show()
         update_preview()
+        # populate() ran before show_all; re-apply visibility now that widgets
+        # are realized (handles the "hide mode_row on drill-in" case too)
+        mode_row.set_visible(state["category"] is None and state["folder"] is None)
+        back_btn.set_visible(state["category"] is not None or state["folder"] is not None)
         resp = dlg.run()
         if resp == Gtk.ResponseType.OK and state["selected_kind"]:
             kind = state["selected_kind"]
