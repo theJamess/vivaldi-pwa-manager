@@ -765,8 +765,15 @@ class PWAManager(Gtk.Window):
 
     def __init__(self):
         super().__init__(title="Vivaldi PWA Manager")
-        self.set_default_size(1080, 720)
-        self.set_icon_name("vivaldi")
+        self.set_default_size(1240, 780)
+        icon_path = SCRIPT_DIR / "docs" / "icon.svg"
+        if icon_path.is_file():
+            try:
+                self.set_icon_from_file(str(icon_path))
+            except Exception:
+                self.set_icon_name("vivaldi")
+        else:
+            self.set_icon_name("vivaldi")
         self.items = []
         self.orphans = []
         self.current = None
@@ -1780,8 +1787,80 @@ class PWAManager(Gtk.Window):
 
         theme = Gtk.IconTheme.get_default()
         all_names = sorted(theme.list_icons(None) or [])
+        contexts = sorted(c for c in (theme.list_contexts() or []) if c)
+        # Cache per-context icon lists once (avoids hammering list_icons)
+        ctx_names = {c: sorted(theme.list_icons(c) or []) for c in contexts}
 
-        state = {"selected": None, "debounce_id": 0}
+        # "Back" button shown only when browsing inside a category
+        back_btn = Gtk.Button.new_from_icon_name(
+            "go-previous-symbolic", Gtk.IconSize.BUTTON)
+        back_btn.set_tooltip_text("Back to categories")
+        back_btn.set_no_show_all(True)
+        search_row.pack_start(back_btn, False, False, 0)
+        # Reorder so back-button sits at the very start of the row
+        search_row.reorder_child(back_btn, 0)
+
+        state = {"selected": None, "category": None, "debounce_id": 0}
+
+        # ---- Rendering: tiles for an icon list, OR tiles for category list
+
+        def make_icon_tile(name, sz):
+            info = theme.lookup_icon(name, sz, 0)
+            if not info:
+                return None
+            try:
+                pix = info.load_icon()
+                if pix.get_width() != sz or pix.get_height() != sz:
+                    pix = pix.scale_simple(sz, sz, GdkPixbuf.InterpType.BILINEAR)
+            except Exception:
+                return None
+            tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            tile.set_margin_top(4); tile.set_margin_bottom(4)
+            tile.pack_start(Gtk.Image.new_from_pixbuf(pix), False, False, 0)
+            lbl = Gtk.Label(label=name, xalign=0.5)
+            lbl.set_max_width_chars(18)
+            lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
+            lbl.get_style_context().add_class("dim-label")
+            tile.pack_start(lbl, False, False, 0)
+            tile._icon_name = name
+            tile.set_tooltip_text(name)
+            return tile
+
+        def make_category_tile(ctx):
+            # Pick a representative icon to display on the tile
+            example = None
+            for candidate in ("folder", "applications-other",
+                              "preferences-system", "image-x-generic"):
+                if candidate in ctx_names.get(ctx, []):
+                    example = candidate
+                    break
+            if example is None and ctx_names.get(ctx):
+                example = ctx_names[ctx][len(ctx_names[ctx]) // 2]
+            pix = None
+            if example:
+                info = theme.lookup_icon(example, 48, 0)
+                if info:
+                    try:
+                        pix = info.load_icon()
+                        if pix.get_width() != 48 or pix.get_height() != 48:
+                            pix = pix.scale_simple(48, 48,
+                                                   GdkPixbuf.InterpType.BILINEAR)
+                    except Exception:
+                        pix = None
+
+            tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            tile.set_margin_top(8); tile.set_margin_bottom(8)
+            if pix is not None:
+                tile.pack_start(Gtk.Image.new_from_pixbuf(pix), False, False, 0)
+            name_lbl = Gtk.Label()
+            name_lbl.set_markup(f"<b>{GLib.markup_escape_text(ctx)}</b>")
+            tile.pack_start(name_lbl, False, False, 0)
+            count_lbl = Gtk.Label(label=f"{len(ctx_names.get(ctx, []))} icons",
+                                  xalign=0.5)
+            count_lbl.get_style_context().add_class("dim-label")
+            tile.pack_start(count_lbl, False, False, 0)
+            tile._category = ctx
+            return tile
 
         def populate():
             state["debounce_id"] = 0
@@ -1790,47 +1869,45 @@ class PWAManager(Gtk.Window):
             state["selected"] = None
             use_btn.set_sensitive(False)
             q = search_entry.get_text().strip().lower()
-            if not q:
+            cat = state["category"]
+            back_btn.set_visible(cat is not None)
+
+            # Mode 1: no search, no category -> show the category list
+            if not q and not cat:
+                for ctx in contexts:
+                    flow.add(make_category_tile(ctx))
+                flow.show_all()
                 status.set_text(
-                    f"{len(all_names)} icons in /usr/share/icons + "
-                    "~/.local/share/icons. Type to search."
+                    f"Pick a category, or type to search across all "
+                    f"{len(all_names)} icons."
                 )
                 return False
+
+            # Mode 2: searching and/or browsing a specific category
             try:
                 sz = int(size_combo.get_active_id() or "48")
             except ValueError:
                 sz = 48
-            matches = [n for n in all_names if q in n.lower()]
+            source = ctx_names.get(cat, all_names) if cat else all_names
+            matches = [n for n in source if q in n.lower()] if q else source
             cap = 240
             shown = matches[:cap]
             for name in shown:
-                info = theme.lookup_icon(name, sz, 0)
-                if not info:
-                    continue
-                try:
-                    pix = info.load_icon()
-                    if pix.get_width() != sz or pix.get_height() != sz:
-                        pix = pix.scale_simple(sz, sz, GdkPixbuf.InterpType.BILINEAR)
-                except Exception:
-                    continue
-                tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-                tile.set_margin_top(4); tile.set_margin_bottom(4)
-                tile.pack_start(Gtk.Image.new_from_pixbuf(pix), False, False, 0)
-                lbl = Gtk.Label(label=name, xalign=0.5)
-                lbl.set_max_width_chars(18)
-                lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
-                lbl.get_style_context().add_class("dim-label")
-                tile.pack_start(lbl, False, False, 0)
-                tile._icon_name = name
-                tile.set_tooltip_text(name)
-                flow.add(tile)
+                tile = make_icon_tile(name, sz)
+                if tile is not None:
+                    flow.add(tile)
             flow.show_all()
-            cap_note = f" (capped at {cap})" if len(matches) > cap else ""
-            status.set_text(
-                f"{len(matches)} match(es){cap_note}." if matches
-                else "No matches."
-            )
-            return False  # one-shot timeout
+            cap_note = f" (showing first {cap})" if len(matches) > cap else ""
+            scope = f" in {cat}" if cat else ""
+            if not matches:
+                status.set_text(f"No icons match '{q}'{scope}.")
+            elif q:
+                status.set_text(
+                    f"{len(matches)} match(es) for '{q}'{scope}{cap_note}.")
+            else:
+                status.set_text(
+                    f"All icons in {cat}: {len(matches)}{cap_note}.")
+            return False  # one-shot
 
         def schedule_search(*_):
             if state["debounce_id"]:
@@ -1844,20 +1921,37 @@ class PWAManager(Gtk.Window):
                 use_btn.set_sensitive(False)
                 return
             tile = children[0].get_child()
+            # Either an icon tile (has _icon_name) or a category tile (_category)
             state["selected"] = getattr(tile, "_icon_name", None)
             use_btn.set_sensitive(state["selected"] is not None)
+
+        def on_activate(_fbox, child):
+            tile = child.get_child()
+            if hasattr(tile, "_category"):
+                state["category"] = tile._category
+                search_entry.set_text("")
+                populate()
+            elif hasattr(tile, "_icon_name"):
+                state["selected"] = tile._icon_name
+                dlg.response(Gtk.ResponseType.OK)
+
+        def on_back(_btn):
+            state["category"] = None
+            search_entry.set_text("")
+            populate()
 
         search_entry.connect("changed", schedule_search)
         size_combo.connect("changed", schedule_search)
         flow.connect("selected-children-changed", on_selection)
-        flow.connect("child-activated", lambda *_: dlg.response(Gtk.ResponseType.OK))
+        flow.connect("child-activated", on_activate)
+        back_btn.connect("clicked", on_back)
 
         # Prefill search with the current Icon entry if it looks like a name
         current = self.icon_entry.get_text().strip()
         if current and not os.path.isabs(current):
             search_entry.set_text(current)
         else:
-            populate()  # show the "type to search" hint
+            populate()
 
         dlg.show_all()
         resp = dlg.run()
