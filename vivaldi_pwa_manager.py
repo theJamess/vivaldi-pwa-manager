@@ -1931,6 +1931,8 @@ class PWAManager(Gtk.Window):
         dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
         use_btn = dlg.add_button("Use selected", Gtk.ResponseType.OK)
         use_btn.set_sensitive(False)
+        use_btn.set_can_default(True)
+        dlg.set_default_response(Gtk.ResponseType.OK)
 
         box = dlg.get_content_area()
         box.set_spacing(8); box.set_margin_top(10)
@@ -2346,8 +2348,11 @@ class PWAManager(Gtk.Window):
                 state["folder"] = tile._value
                 search_entry.set_text("")
                 populate()
-            elif kind in ("theme", "file"):
-                dlg.response(Gtk.ResponseType.OK)
+            # For icon tiles: do NOT auto-close. Selecting an icon is what
+            # populates the preview / enables the colour picker; user explicitly
+            # clicks "Use selected" (or hits Enter, which fires it as the
+            # default response) to commit. Otherwise picking a colour would
+            # be impossible.
 
         def on_back(_btn):
             state["category"] = None
