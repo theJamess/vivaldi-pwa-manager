@@ -46,6 +46,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 INSTALL_SCREENSHOT = SCRIPT_DIR / "docs" / "install-via-vivaldi.png"
 
 FETCHED_ICONS_DIR = Path.home() / ".local/share/vivaldi-pwa-icons"
+ICON_THEME_ROOTS = (
+    "/usr/share/icons", "/usr/local/share/icons",
+    str(Path.home() / ".local/share/icons"), str(Path.home() / ".icons"),
+)
 HTTP_TIMEOUT = 10
 HTTP_USER_AGENT = "Mozilla/5.0 vivaldi-pwa-manager/1.0"
 MAX_ICON_BYTES = 4 * 1024 * 1024  # 4 MB per icon; refuse anything wilder
@@ -738,6 +742,172 @@ def rank_candidates(cands):
     )
 
 
+# ---------- Icon tinting (for symbolic + monocolor SVG icons) ----------
+
+_SVG_PROTECTED_FILLS = {
+    "none", "transparent", "white", "black",
+    "#fff", "#ffffff", "#000", "#000000",
+    "currentcolor",
+}
+
+
+def recolor_svg_text(svg_text: str, target_hex: str) -> str:
+    """Best-effort: replace fill colours with target_hex, leaving structural
+    ones (none / transparent / pure white / pure black) untouched. Works on
+    `fill="…"` attributes and `style="…fill:…"` declarations. Doesn't try to
+    parse CSS classes — multi-coloured SVGs come through partially recoloured
+    (which is fine for the preview-and-decide UX)."""
+    def repl_attr(m):
+        val = m.group(1).strip()
+        if val.lower() in _SVG_PROTECTED_FILLS:
+            return m.group(0)
+        return f'fill="{target_hex}"'
+
+    def repl_style(m):
+        val = m.group(1).strip()
+        if val.lower() in _SVG_PROTECTED_FILLS:
+            return m.group(0)
+        return f"fill:{target_hex}"
+
+    svg_text = re.sub(r'fill="([^"]+)"', repl_attr, svg_text)
+    svg_text = re.sub(r"fill:\s*([^;\"\s}]+)", repl_style, svg_text)
+    return svg_text
+
+
+def render_recolored_svg(svg_path: str, target_hex: str, size: int):
+    """Load svg_path, replace fills with target_hex, return a Pixbuf at size."""
+    try:
+        text = Path(svg_path).read_text()
+    except Exception:
+        return None
+    colored = recolor_svg_text(text, target_hex)
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".svg", delete=False,
+            dir=str(FETCHED_ICONS_DIR) if FETCHED_ICONS_DIR.exists() else None,
+        ) as f:
+            f.write(colored.encode("utf-8"))
+            tmp = f.name
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file_at_size(tmp, size, size)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except Exception:
+        return None
+
+
+def rgba_to_hex(rgba) -> str:
+    return (
+        f"#{int(rgba.red * 255):02x}"
+        f"{int(rgba.green * 255):02x}"
+        f"{int(rgba.blue * 255):02x}"
+    )
+
+
+def save_tinted_icon(icon_name: str, icon_info, rgba) -> str:
+    """Save a coloured variant of an icon to FETCHED_ICONS_DIR.
+
+    For symbolic icons we render with GTK's load_symbolic() and save the
+    pixbuf as PNG. For non-symbolic SVGs we apply best-effort fill-
+    replacement and save the modified SVG. Returns absolute path of the
+    saved file, or empty string if the icon can't be tinted."""
+    if icon_info is None:
+        return ""
+    FETCHED_ICONS_DIR.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", icon_name).strip("-").lower() or "icon"
+    color_hex = rgba_to_hex(rgba)
+    color_token = color_hex.lstrip("#")
+
+    if icon_info.is_symbolic():
+        try:
+            pix, _ = icon_info.load_symbolic(rgba)
+        except Exception:
+            return ""
+        dest = FETCHED_ICONS_DIR / f"{slug}-{color_token}.png"
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = FETCHED_ICONS_DIR / f"{slug}-{color_token}-{n}.png"
+        try:
+            pix.savev(str(dest), "png", [], [])
+            return str(dest)
+        except Exception:
+            return ""
+
+    src_path = icon_info.get_filename() or ""
+    if src_path.lower().endswith(".svg"):
+        try:
+            text = Path(src_path).read_text()
+        except Exception:
+            return ""
+        colored = recolor_svg_text(text, color_hex)
+        dest = FETCHED_ICONS_DIR / f"{slug}-{color_token}.svg"
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = FETCHED_ICONS_DIR / f"{slug}-{color_token}-{n}.svg"
+        try:
+            dest.write_text(colored)
+            return str(dest)
+        except Exception:
+            return ""
+    return ""
+
+
+def enumerate_icon_folders(max_depth=5):
+    """Return a list of dicts {path, label, count, sample} for every folder
+    under the known icon-theme roots that contains image files. Cheap
+    pre-render: sample is the absolute path of one example image."""
+    out = []
+    seen = set()
+    for root in ICON_THEME_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        root_norm = os.path.realpath(root)
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Bound walk depth
+            depth = dirpath[len(root):].count(os.sep)
+            if depth > max_depth:
+                del dirnames[:]
+                continue
+            icon_files = [
+                f for f in filenames
+                if f.lower().endswith((".png", ".svg", ".xpm"))
+            ]
+            if not icon_files:
+                continue
+            real = os.path.realpath(dirpath)
+            if real in seen:
+                continue
+            seen.add(real)
+            rel = os.path.relpath(dirpath, root)
+            label = f"{os.path.basename(root_norm)}/{rel}" if rel != "." \
+                else os.path.basename(root_norm)
+            out.append({
+                "path": dirpath,
+                "label": label,
+                "count": len(icon_files),
+                "sample": os.path.join(dirpath, sorted(icon_files)[0]),
+            })
+    out.sort(key=lambda d: d["label"].lower())
+    return out
+
+
+def list_icon_files_in_folder(folder_path):
+    """Return absolute paths of icon files directly in folder_path."""
+    try:
+        return sorted(
+            os.path.join(folder_path, f)
+            for f in os.listdir(folder_path)
+            if f.lower().endswith((".png", ".svg", ".xpm"))
+        )
+    except OSError:
+        return []
+
+
 def save_fetched_icon(body, src_href, slug):
     """Write bytes to FETCHED_ICONS_DIR/<slug>.<ext>, picking a non-clashing
     name. Returns the absolute destination path."""
@@ -1312,10 +1482,12 @@ class PWAManager(Gtk.Window):
                        "installing a site as an app — pick an orphan PWA "
                        "from the list, or change this launcher to a Web App "
                        "or Sandboxed window instead.")
-        elif new_kind in ("webapp", "sandboxed") and not url:
-            problem = (f"Switching to {dict(KIND_LABELS)[new_kind]} needs a "
-                       "URL. Fill in the URL field above first, then change "
-                       "the Kind dropdown.")
+        elif new_kind == "webapp" and not url:
+            problem = ("Switching to Web App needs a URL — that's the entire "
+                       "point of --app=URL. Fill in the URL field above "
+                       "first, then change the Kind dropdown.")
+        # Sandboxed without a URL is fine — it'll open Vivaldi at whatever
+        # the profile's startup pages / pinned tabs set up.
         if problem:
             self._error(problem)
             # Revert the dropdown without re-triggering this handler
@@ -1368,7 +1540,8 @@ class PWAManager(Gtk.Window):
         kind_combo.append("webapp", "Web App  (chromeless --app=URL)")
         kind_combo.set_active_id("vivaldi-install")
         name_e = Gtk.Entry(placeholder_text="e.g. Portainer")
-        url_e = Gtk.Entry(placeholder_text="https://…")
+        url_e = Gtk.Entry(
+            placeholder_text="https://…  (optional for Sandboxed window)")
         icon_e = Gtk.Entry(placeholder_text="Icon name or path (optional)")
         labels = {}
         rows = (("Kind", kind_combo), ("Name", name_e), ("URL", url_e), ("Icon", icon_e))
@@ -1416,8 +1589,9 @@ class PWAManager(Gtk.Window):
             elif k == "sandboxed":
                 note.set_text(
                     "Sandboxed: full Vivaldi window (tabs + address bar) with "
-                    "its own Chromium profile and WM class. Pinned as a "
-                    "separate app in the taskbar."
+                    "its own Chromium profile and WM class. URL optional — "
+                    "leave blank to open the profile cold and let pinned "
+                    "tabs / startup pages decide what loads."
                 )
                 ok_btn.set_label("Create")
             else:
@@ -1467,8 +1641,14 @@ class PWAManager(Gtk.Window):
                 )
                 info.run(); info.destroy()
                 return
-            if not name or not url:
-                self._error("Name and URL are required.")
+            if not name:
+                self._error("Name is required.")
+                return
+            if kind == "webapp" and not url:
+                self._error(
+                    "Web App needs a URL — that's the --app=URL it gets "
+                    "passed. Use Sandboxed window if you'd rather open the "
+                    "profile without a starting page.")
                 return
             self._create_new_launcher(kind, name, url, icon)
         else:
@@ -1747,7 +1927,7 @@ class PWAManager(Gtk.Window):
     # ---- system icon-theme browser ----
     def _icon_theme_browser_dialog(self):
         dlg = Gtk.Dialog(title="Browse system icons", transient_for=self, modal=True)
-        dlg.set_default_size(740, 580)
+        dlg.set_default_size(820, 760)
         dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
         use_btn = dlg.add_button("Use selected", Gtk.ResponseType.OK)
         use_btn.set_sensitive(False)
@@ -1756,7 +1936,13 @@ class PWAManager(Gtk.Window):
         box.set_spacing(8); box.set_margin_top(10)
         box.set_margin_start(10); box.set_margin_end(10); box.set_margin_bottom(10)
 
+        # --- Top row: back + search + size ---
         search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        back_btn = Gtk.Button.new_from_icon_name(
+            "go-previous-symbolic", Gtk.IconSize.BUTTON)
+        back_btn.set_tooltip_text("Back to the top-level list")
+        back_btn.set_no_show_all(True)
+        search_row.pack_start(back_btn, False, False, 0)
         search_row.pack_start(Gtk.Label(label="Search:", xalign=0), False, False, 0)
         search_entry = Gtk.Entry(
             placeholder_text="e.g. browser, mail, chat, vivaldi, web-, applications-")
@@ -1766,14 +1952,26 @@ class PWAManager(Gtk.Window):
                           ("64", "64px"), ("96", "96px")):
             size_combo.append(sz, label)
         size_combo.set_active_id("48")
-        size_combo.set_tooltip_text("Thumbnail size in the grid")
+        size_combo.set_tooltip_text("Thumbnail size")
         search_row.pack_start(size_combo, False, False, 0)
         box.pack_start(search_row, False, False, 0)
+
+        # --- Browse-by toggle (Categories | Folders) ---
+        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        mode_row.set_no_show_all(True)
+        mode_row.pack_start(Gtk.Label(label="Browse by:", xalign=0),
+                            False, False, 0)
+        rb_cat = Gtk.RadioButton.new_with_label_from_widget(None, "Categories")
+        rb_folder = Gtk.RadioButton.new_with_label_from_widget(rb_cat, "Folders")
+        for rb in (rb_cat, rb_folder):
+            mode_row.pack_start(rb, False, False, 0)
+        box.pack_start(mode_row, False, False, 0)
 
         status = Gtk.Label(xalign=0)
         status.get_style_context().add_class("dim-label")
         box.pack_start(status, False, False, 0)
 
+        # --- Grid ---
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         flow = Gtk.FlowBox()
@@ -1785,26 +1983,67 @@ class PWAManager(Gtk.Window):
         sw.add(flow)
         box.pack_start(sw, True, True, 0)
 
+        # --- Preview / color row ---
+        preview_frame = Gtk.Frame()
+        preview_frame.set_margin_top(4)
+        preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        preview_box.set_margin_top(8); preview_box.set_margin_bottom(8)
+        preview_box.set_margin_start(10); preview_box.set_margin_end(10)
+        preview_frame.add(preview_box)
+
+        preview_img = Gtk.Image()
+        preview_img.set_size_request(96, 96)
+        preview_box.pack_start(preview_img, False, False, 0)
+
+        preview_meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        preview_name = Gtk.Label(xalign=0, selectable=True)
+        preview_meta.pack_start(preview_name, False, False, 0)
+
+        color_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        color_lbl = Gtk.Label(label="Tint:", xalign=0)
+        color_row.pack_start(color_lbl, False, False, 0)
+        color_btn = Gtk.ColorButton()
+        color_btn.set_use_alpha(False)
+        default_rgba = Gdk.RGBA(); default_rgba.parse("#3584e4")
+        color_btn.set_rgba(default_rgba)
+        color_row.pack_start(color_btn, False, False, 0)
+        color_clear = Gtk.Button(label="Clear")
+        color_clear.set_tooltip_text("Use the icon's native colors")
+        color_row.pack_start(color_clear, False, False, 0)
+        preview_meta.pack_start(color_row, False, False, 0)
+
+        preview_note = Gtk.Label(xalign=0)
+        preview_note.set_line_wrap(True)
+        preview_note.get_style_context().add_class("dim-label")
+        preview_meta.pack_start(preview_note, False, False, 0)
+        preview_box.pack_start(preview_meta, True, True, 0)
+        box.pack_start(preview_frame, False, False, 0)
+
+        # --- Data ---
         theme = Gtk.IconTheme.get_default()
         all_names = sorted(theme.list_icons(None) or [])
         contexts = sorted(c for c in (theme.list_contexts() or []) if c)
-        # Cache per-context icon lists once (avoids hammering list_icons)
         ctx_names = {c: sorted(theme.list_icons(c) or []) for c in contexts}
+        folders_cache = {"data": None}
 
-        # "Back" button shown only when browsing inside a category
-        back_btn = Gtk.Button.new_from_icon_name(
-            "go-previous-symbolic", Gtk.IconSize.BUTTON)
-        back_btn.set_tooltip_text("Back to categories")
-        back_btn.set_no_show_all(True)
-        search_row.pack_start(back_btn, False, False, 0)
-        # Reorder so back-button sits at the very start of the row
-        search_row.reorder_child(back_btn, 0)
+        def folders():
+            if folders_cache["data"] is None:
+                folders_cache["data"] = enumerate_icon_folders()
+            return folders_cache["data"]
 
-        state = {"selected": None, "category": None, "debounce_id": 0}
+        # --- State ---
+        # selected_kind: None | "theme" (selected is icon name) | "file" (path)
+        state = {
+            "selected_kind": None, "selected_value": None,
+            "browse_mode": "categories",  # "categories" | "folders"
+            "category": None, "folder": None,
+            "color": None,            # Gdk.RGBA, or None to mean "no tint"
+            "selected_info": None,    # Gtk.IconInfo for theme icons
+            "debounce_id": 0,
+        }
 
-        # ---- Rendering: tiles for an icon list, OR tiles for category list
-
-        def make_icon_tile(name, sz):
+        # --- Tile factories ---
+        def make_theme_icon_tile(name, sz):
             info = theme.lookup_icon(name, sz, 0)
             if not info:
                 return None
@@ -1814,20 +2053,34 @@ class PWAManager(Gtk.Window):
                     pix = pix.scale_simple(sz, sz, GdkPixbuf.InterpType.BILINEAR)
             except Exception:
                 return None
+            tile = _make_tile(Gtk.Image.new_from_pixbuf(pix), name)
+            tile._kind = "theme"; tile._value = name
+            return tile
+
+        def make_file_icon_tile(path, sz):
+            try:
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_size(path, sz, sz)
+            except Exception:
+                return None
+            tile = _make_tile(Gtk.Image.new_from_pixbuf(pix),
+                              os.path.basename(path))
+            tile._kind = "file"; tile._value = path
+            tile.set_tooltip_text(path)
+            return tile
+
+        def _make_tile(image_widget, caption):
             tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             tile.set_margin_top(4); tile.set_margin_bottom(4)
-            tile.pack_start(Gtk.Image.new_from_pixbuf(pix), False, False, 0)
-            lbl = Gtk.Label(label=name, xalign=0.5)
+            tile.pack_start(image_widget, False, False, 0)
+            lbl = Gtk.Label(label=caption, xalign=0.5)
             lbl.set_max_width_chars(18)
-            lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
+            lbl.set_ellipsize(3)
             lbl.get_style_context().add_class("dim-label")
             tile.pack_start(lbl, False, False, 0)
-            tile._icon_name = name
-            tile.set_tooltip_text(name)
+            tile.set_tooltip_text(caption)
             return tile
 
         def make_category_tile(ctx):
-            # Pick a representative icon to display on the tile
             example = None
             for candidate in ("folder", "applications-other",
                               "preferences-system", "image-x-generic"):
@@ -1843,11 +2096,10 @@ class PWAManager(Gtk.Window):
                     try:
                         pix = info.load_icon()
                         if pix.get_width() != 48 or pix.get_height() != 48:
-                            pix = pix.scale_simple(48, 48,
-                                                   GdkPixbuf.InterpType.BILINEAR)
+                            pix = pix.scale_simple(
+                                48, 48, GdkPixbuf.InterpType.BILINEAR)
                     except Exception:
                         pix = None
-
             tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             tile.set_margin_top(8); tile.set_margin_bottom(8)
             if pix is not None:
@@ -1855,60 +2107,202 @@ class PWAManager(Gtk.Window):
             name_lbl = Gtk.Label()
             name_lbl.set_markup(f"<b>{GLib.markup_escape_text(ctx)}</b>")
             tile.pack_start(name_lbl, False, False, 0)
-            count_lbl = Gtk.Label(label=f"{len(ctx_names.get(ctx, []))} icons",
-                                  xalign=0.5)
+            count_lbl = Gtk.Label(
+                label=f"{len(ctx_names.get(ctx, []))} icons", xalign=0.5)
             count_lbl.get_style_context().add_class("dim-label")
             tile.pack_start(count_lbl, False, False, 0)
-            tile._category = ctx
+            tile._kind = "category"; tile._value = ctx
             return tile
 
+        def make_folder_tile(folder_dict):
+            pix = None
+            sample = folder_dict["sample"]
+            if sample:
+                try:
+                    pix = GdkPixbuf.Pixbuf.new_from_file_at_size(sample, 48, 48)
+                except Exception:
+                    pix = None
+            tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            tile.set_margin_top(8); tile.set_margin_bottom(8)
+            if pix is not None:
+                tile.pack_start(Gtk.Image.new_from_pixbuf(pix), False, False, 0)
+            name_lbl = Gtk.Label()
+            name_lbl.set_markup(
+                f"<b>{GLib.markup_escape_text(folder_dict['label'])}</b>")
+            name_lbl.set_max_width_chars(28)
+            name_lbl.set_ellipsize(3)
+            tile.pack_start(name_lbl, False, False, 0)
+            count_lbl = Gtk.Label(
+                label=f"{folder_dict['count']} files", xalign=0.5)
+            count_lbl.get_style_context().add_class("dim-label")
+            tile.pack_start(count_lbl, False, False, 0)
+            tile.set_tooltip_text(folder_dict["path"])
+            tile._kind = "folder"; tile._value = folder_dict["path"]
+            return tile
+
+        # --- Populate ---
         def populate():
             state["debounce_id"] = 0
             for child in flow.get_children():
                 flow.remove(child)
-            state["selected"] = None
+            state["selected_kind"] = None
+            state["selected_value"] = None
+            state["selected_info"] = None
             use_btn.set_sensitive(False)
+            update_preview()
             q = search_entry.get_text().strip().lower()
-            cat = state["category"]
-            back_btn.set_visible(cat is not None)
+            at_top = state["category"] is None and state["folder"] is None
+            back_btn.set_visible(not at_top)
+            mode_row.set_visible(at_top)
 
-            # Mode 1: no search, no category -> show the category list
-            if not q and not cat:
-                for ctx in contexts:
-                    flow.add(make_category_tile(ctx))
+            if at_top and not q:
+                # Top-level: show categories OR folders
+                if state["browse_mode"] == "categories":
+                    for ctx in contexts:
+                        flow.add(make_category_tile(ctx))
+                    status.set_text(
+                        f"Pick a category, or type to search across all "
+                        f"{len(all_names)} icons.")
+                else:
+                    for f in folders():
+                        flow.add(make_folder_tile(f))
+                    status.set_text(
+                        f"{len(folders())} folder(s) found under "
+                        f"/usr/share/icons + ~/.local/share/icons.")
                 flow.show_all()
-                status.set_text(
-                    f"Pick a category, or type to search across all "
-                    f"{len(all_names)} icons."
-                )
                 return False
 
-            # Mode 2: searching and/or browsing a specific category
             try:
                 sz = int(size_combo.get_active_id() or "48")
             except ValueError:
                 sz = 48
-            source = ctx_names.get(cat, all_names) if cat else all_names
-            matches = [n for n in source if q in n.lower()] if q else source
-            cap = 240
-            shown = matches[:cap]
-            for name in shown:
-                tile = make_icon_tile(name, sz)
-                if tile is not None:
-                    flow.add(tile)
-            flow.show_all()
-            cap_note = f" (showing first {cap})" if len(matches) > cap else ""
-            scope = f" in {cat}" if cat else ""
-            if not matches:
-                status.set_text(f"No icons match '{q}'{scope}.")
-            elif q:
-                status.set_text(
-                    f"{len(matches)} match(es) for '{q}'{scope}{cap_note}.")
-            else:
-                status.set_text(
-                    f"All icons in {cat}: {len(matches)}{cap_note}.")
-            return False  # one-shot
 
+            if state["folder"]:
+                files = list_icon_files_in_folder(state["folder"])
+                matches = [
+                    p for p in files
+                    if not q or q in os.path.basename(p).lower()
+                ]
+                cap = 240
+                for path in matches[:cap]:
+                    tile = make_file_icon_tile(path, sz)
+                    if tile is not None:
+                        flow.add(tile)
+                cap_note = f" (showing first {cap})" if len(matches) > cap else ""
+                if not matches:
+                    status.set_text(
+                        f"No files match '{q}' in {state['folder']}." if q
+                        else f"No image files in {state['folder']}.")
+                else:
+                    status.set_text(
+                        f"{len(matches)} file(s) in {state['folder']}{cap_note}.")
+            else:
+                cat = state["category"]
+                source = ctx_names.get(cat, all_names) if cat else all_names
+                matches = [n for n in source if q in n.lower()] if q else source
+                cap = 240
+                for name in matches[:cap]:
+                    tile = make_theme_icon_tile(name, sz)
+                    if tile is not None:
+                        flow.add(tile)
+                cap_note = f" (showing first {cap})" if len(matches) > cap else ""
+                scope = f" in {cat}" if cat else ""
+                if not matches:
+                    status.set_text(f"No icons match '{q}'{scope}.")
+                elif q:
+                    status.set_text(
+                        f"{len(matches)} match(es) for '{q}'{scope}{cap_note}.")
+                else:
+                    status.set_text(
+                        f"All icons in {cat}: {len(matches)}{cap_note}.")
+            flow.show_all()
+            return False
+
+        # --- Preview / color ---
+        def selected_source_svg_path():
+            """If selected icon is a non-symbolic SVG file we can recolor,
+            return its absolute path. Otherwise return ''."""
+            if state["selected_kind"] == "theme" and state["selected_info"]:
+                info = state["selected_info"]
+                if not info.is_symbolic():
+                    fn = info.get_filename() or ""
+                    if fn.lower().endswith(".svg"):
+                        return fn
+            elif state["selected_kind"] == "file":
+                p = state["selected_value"] or ""
+                if p.lower().endswith(".svg"):
+                    return p
+            return ""
+
+        def selected_is_symbolic():
+            info = state["selected_info"]
+            return bool(info and info.is_symbolic())
+
+        def update_preview():
+            kind = state["selected_kind"]
+            if not kind:
+                preview_img.clear()
+                preview_name.set_text("")
+                preview_note.set_text(
+                    "Click any icon above to preview. "
+                    "For symbolic / monocolor SVG icons you'll be able to pick "
+                    "a tint colour.")
+                for w in (color_btn, color_clear, color_lbl):
+                    w.set_sensitive(False)
+                return
+            symbolic = selected_is_symbolic()
+            recolorable_svg = bool(selected_source_svg_path())
+            tintable = symbolic or recolorable_svg
+            for w in (color_btn, color_lbl):
+                w.set_sensitive(tintable)
+            color_clear.set_sensitive(tintable and state["color"] is not None)
+
+            pix = None
+            color = state["color"] if tintable else None
+            if symbolic and color is not None:
+                try:
+                    pix, _ = state["selected_info"].load_symbolic(color)
+                except Exception:
+                    pix = None
+            elif recolorable_svg and color is not None:
+                pix = render_recolored_svg(
+                    selected_source_svg_path(), rgba_to_hex(color), 96)
+            if pix is None:
+                # Native render
+                if kind == "theme":
+                    info = state["selected_info"]
+                    if info:
+                        try:
+                            pix = info.load_icon()
+                            if pix.get_width() != 96 or pix.get_height() != 96:
+                                pix = pix.scale_simple(
+                                    96, 96, GdkPixbuf.InterpType.BILINEAR)
+                        except Exception:
+                            pix = None
+                else:
+                    try:
+                        pix = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                            state["selected_value"], 96, 96)
+                    except Exception:
+                        pix = None
+            if pix:
+                preview_img.set_from_pixbuf(pix)
+            else:
+                preview_img.set_from_icon_name(
+                    "image-missing", Gtk.IconSize.DIALOG)
+            preview_name.set_text(str(state["selected_value"]))
+            if symbolic:
+                preview_note.set_text(
+                    "Symbolic icon — tint colour fully supported.")
+            elif recolorable_svg:
+                preview_note.set_text(
+                    "SVG — best-effort tint (multi-colour icons may keep some "
+                    "of their original fills).")
+            else:
+                preview_note.set_text(
+                    "Raster icon — tint not supported.")
+
+        # --- Handlers ---
         def schedule_search(*_):
             if state["debounce_id"]:
                 GLib.source_remove(state["debounce_id"])
@@ -1917,36 +2311,75 @@ class PWAManager(Gtk.Window):
         def on_selection(fbox):
             children = fbox.get_selected_children()
             if not children:
-                state["selected"] = None
+                state["selected_kind"] = None
+                state["selected_value"] = None
+                state["selected_info"] = None
                 use_btn.set_sensitive(False)
+                update_preview()
                 return
             tile = children[0].get_child()
-            # Either an icon tile (has _icon_name) or a category tile (_category)
-            state["selected"] = getattr(tile, "_icon_name", None)
-            use_btn.set_sensitive(state["selected"] is not None)
+            kind = getattr(tile, "_kind", None)
+            if kind not in ("theme", "file"):
+                state["selected_kind"] = None
+                state["selected_value"] = None
+                state["selected_info"] = None
+                use_btn.set_sensitive(False)
+                update_preview()
+                return
+            state["selected_kind"] = kind
+            state["selected_value"] = tile._value
+            if kind == "theme":
+                state["selected_info"] = theme.lookup_icon(tile._value, 256, 0)
+            else:
+                state["selected_info"] = None
+            use_btn.set_sensitive(True)
+            update_preview()
 
         def on_activate(_fbox, child):
             tile = child.get_child()
-            if hasattr(tile, "_category"):
-                state["category"] = tile._category
+            kind = getattr(tile, "_kind", None)
+            if kind == "category":
+                state["category"] = tile._value
                 search_entry.set_text("")
                 populate()
-            elif hasattr(tile, "_icon_name"):
-                state["selected"] = tile._icon_name
+            elif kind == "folder":
+                state["folder"] = tile._value
+                search_entry.set_text("")
+                populate()
+            elif kind in ("theme", "file"):
                 dlg.response(Gtk.ResponseType.OK)
 
         def on_back(_btn):
             state["category"] = None
+            state["folder"] = None
             search_entry.set_text("")
             populate()
+
+        def on_mode_changed(_btn):
+            if rb_cat.get_active():
+                state["browse_mode"] = "categories"
+            else:
+                state["browse_mode"] = "folders"
+            populate()
+
+        def on_color_set(_btn):
+            state["color"] = color_btn.get_rgba()
+            update_preview()
+
+        def on_color_clear(_btn):
+            state["color"] = None
+            update_preview()
 
         search_entry.connect("changed", schedule_search)
         size_combo.connect("changed", schedule_search)
         flow.connect("selected-children-changed", on_selection)
         flow.connect("child-activated", on_activate)
         back_btn.connect("clicked", on_back)
+        rb_cat.connect("toggled", on_mode_changed)
+        rb_folder.connect("toggled", on_mode_changed)
+        color_btn.connect("color-set", on_color_set)
+        color_clear.connect("clicked", on_color_clear)
 
-        # Prefill search with the current Icon entry if it looks like a name
         current = self.icon_entry.get_text().strip()
         if current and not os.path.isabs(current):
             search_entry.set_text(current)
@@ -1954,10 +2387,50 @@ class PWAManager(Gtk.Window):
             populate()
 
         dlg.show_all()
+        mode_row.show()
+        update_preview()
         resp = dlg.run()
-        if resp == Gtk.ResponseType.OK and state["selected"]:
-            self.icon_entry.set_text(state["selected"])
-            self._set_status(f"Icon set to '{state['selected']}'")
+        if resp == Gtk.ResponseType.OK and state["selected_kind"]:
+            kind = state["selected_kind"]
+            value = state["selected_value"]
+            color = state["color"]
+            tinted_path = ""
+            if color is not None:
+                if kind == "theme":
+                    info = state["selected_info"] or theme.lookup_icon(value, 256, 0)
+                    tinted_path = save_tinted_icon(value, info, color)
+                else:
+                    # File-mode: build a pseudo IconInfo-like for save_tinted_icon
+                    # by writing a temporary symlink? simpler: handle file SVG recolor
+                    # inline.
+                    if value.lower().endswith(".svg"):
+                        try:
+                            src = Path(value).read_text()
+                            colored = recolor_svg_text(src, rgba_to_hex(color))
+                            slug = re.sub(r"[^A-Za-z0-9_-]+", "-",
+                                          Path(value).stem).strip("-").lower() \
+                                          or "icon"
+                            hex_token = rgba_to_hex(color).lstrip("#")
+                            FETCHED_ICONS_DIR.mkdir(parents=True, exist_ok=True)
+                            dest = FETCHED_ICONS_DIR / f"{slug}-{hex_token}.svg"
+                            n = 1
+                            while dest.exists():
+                                n += 1
+                                dest = FETCHED_ICONS_DIR / \
+                                    f"{slug}-{hex_token}-{n}.svg"
+                            dest.write_text(colored)
+                            tinted_path = str(dest)
+                        except Exception:
+                            tinted_path = ""
+            if tinted_path:
+                self.icon_entry.set_text(tinted_path)
+                self._set_status(f"Icon saved at {tinted_path}")
+            elif kind == "theme":
+                self.icon_entry.set_text(value)
+                self._set_status(f"Icon set to '{value}'")
+            else:
+                self.icon_entry.set_text(value)
+                self._set_status(f"Icon set to {value}")
         dlg.destroy()
 
     # ---- actions ----
