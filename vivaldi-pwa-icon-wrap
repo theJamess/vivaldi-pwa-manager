@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""vivaldi-pwa-icon-wrap — launch a Vivaldi command, then patch _NET_WM_ICON
-on the resulting window so alt-tab / taskbar show the right icon instead of
-Chromium's default. Helper for vivaldi-pwa-manager. X11 only.
+"""vivaldi-pwa-icon-wrap — launch a Vivaldi command, then poke the resulting
+window with X11 fixups: set _NET_WM_ICON so alt-tab/taskbar show the right
+icon, and/or set _NET_WM_STATE_STICKY so the window is visible on every
+workspace. Helper for vivaldi-pwa-manager. X11 only.
 
 Usage:
-    vivaldi-pwa-icon-wrap <icon-path> <wm-class> -- <command...>
+    # Flag form (preferred — supports all features)
+    vivaldi-pwa-icon-wrap --class WMCLASS [--icon PATH] [--sticky] -- <cmd...>
 
-If python-xlib or PyGObject is missing, or the icon can't be loaded, we
-silently fall through to exec(cmd) so a misconfigured environment never
-breaks the user's launcher.
+    # Legacy positional form (icon-only, kept for backwards compatibility
+    # with launchers saved by older versions of the manager)
+    vivaldi-pwa-icon-wrap <icon-path> <wm-class> -- <cmd...>
+
+If python-xlib or PyGObject is missing, or the requested X11 fixups can't
+be applied for any reason, we silently fall through to a plain exec so a
+misconfigured environment never breaks the user's launcher.
 """
 
 import array
@@ -21,6 +27,8 @@ import time
 def fall_through(cmd):
     os.execvp(cmd[0], cmd)
 
+
+# ---------- Icon loading ----------
 
 def load_icon_argb(path, target_size=128):
     """Return [w, h, *argb_ints] suitable for _NET_WM_ICON, or None."""
@@ -40,7 +48,6 @@ def load_icon_argb(path, target_size=128):
     stride = pb.get_rowstride()
     pixels = pb.get_pixels()
     out = array.array("I", [w, h])
-    # Pack RGBA bytes → ARGB cardinals, row by row (stride may be > w*4).
     row_len = w * 4
     for y in range(h):
         base = y * stride
@@ -51,9 +58,9 @@ def load_icon_argb(path, target_size=128):
     return out.tolist()
 
 
+# ---------- Window discovery ----------
+
 def find_windows(display, wm_class):
-    """Return set of window IDs whose WM_CLASS contains wm_class. Walks one
-    level into each top-level (some WMs reparent)."""
     found = set()
     root = display.screen().root
     try:
@@ -78,6 +85,8 @@ def _safe_children(win):
         return []
 
 
+# ---------- X11 fixups ----------
+
 def apply_icon(display, wid, icon_data):
     from Xlib import Xatom
     NET_WM_ICON = display.intern_atom("_NET_WM_ICON")
@@ -90,21 +99,100 @@ def apply_icon(display, wid, icon_data):
         return False
 
 
+def apply_sticky(display, wid):
+    """Mark window sticky (visible on all workspaces) via _NET_WM_STATE
+    ClientMessage. ACTION=_NET_WM_STATE_ADD (1)."""
+    try:
+        from Xlib import X
+        from Xlib.protocol.event import ClientMessage
+        NET_WM_STATE = display.intern_atom("_NET_WM_STATE")
+        STICKY = display.intern_atom("_NET_WM_STATE_STICKY")
+        SOURCE_NORMAL_APP = 1
+        win = display.create_resource_object("window", wid)
+        ev = ClientMessage(
+            window=win,
+            client_type=NET_WM_STATE,
+            # data: action=ADD, prop1=STICKY, prop2=0, source=normal-app, pad
+            data=(32, [1, STICKY, 0, SOURCE_NORMAL_APP, 0]),
+        )
+        display.screen().root.send_event(
+            ev,
+            event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+        )
+        display.sync()
+        return True
+    except Exception:
+        return False
+
+
+# ---------- Arg parsing ----------
+
+def parse_args(argv):
+    """Returns dict {class, icon, sticky, cmd} or raises ValueError."""
+    args = argv[1:]
+    if not args:
+        raise ValueError("no arguments")
+    out = {"class": "", "icon": "", "sticky": False, "cmd": []}
+    if args[0].startswith("--"):
+        # Flag form
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            if tok == "--":
+                out["cmd"] = args[i + 1:]
+                break
+            if tok == "--class":
+                out["class"] = args[i + 1]; i += 2
+            elif tok == "--icon":
+                out["icon"] = args[i + 1]; i += 2
+            elif tok == "--sticky":
+                out["sticky"] = True; i += 1
+            else:
+                raise ValueError(f"unknown flag: {tok}")
+        if not out["class"]:
+            raise ValueError("--class is required")
+    else:
+        # Legacy positional form: <icon> <class> -- <cmd>
+        if len(args) < 4 or args[2] != "--":
+            raise ValueError("legacy form: <icon> <class> -- <cmd>")
+        out["icon"] = args[0]
+        out["class"] = args[1]
+        out["cmd"] = args[3:]
+    if not out["cmd"]:
+        raise ValueError("missing command after --")
+    return out
+
+
+# ---------- Main ----------
+
 def main(argv):
-    if len(argv) < 5 or argv[3] != "--":
+    try:
+        args = parse_args(argv)
+    except ValueError as e:
         sys.stderr.write(
+            f"{os.path.basename(argv[0])}: {e}\n"
             f"usage: {os.path.basename(argv[0])} "
-            "<icon-path> <wm-class> -- <command...>\n"
+            "--class WMCLASS [--icon PATH] [--sticky] -- <cmd...>\n"
         )
         return 2
-    icon_path, wm_class, cmd = argv[1], argv[2], argv[4:]
 
-    icon_data = load_icon_argb(icon_path) if os.path.isfile(icon_path) else None
+    wm_class = args["class"]
+    icon = args["icon"]
+    sticky = args["sticky"]
+    cmd = args["cmd"]
+
+    # Decide what fixups we'd even try to apply
+    wants_icon = bool(icon) and os.path.isfile(icon)
+    icon_data = load_icon_argb(icon) if wants_icon else None
+    if wants_icon and icon_data is None:
+        wants_icon = False  # couldn't load — skip
+
+    if not (wants_icon or sticky):
+        fall_through(cmd)
+
     try:
         from Xlib import display as _xdisplay
     except Exception:
-        fall_through(cmd)
-    if icon_data is None:
         fall_through(cmd)
 
     display = _xdisplay.Display()
@@ -114,15 +202,18 @@ def main(argv):
 
     # Poll up to ~10 s for a new window of this class. Vivaldi's singleton-IPC
     # means our spawned process may exit quickly while the actual window is
-    # created by an already-running Vivaldi instance — that's why we identify
-    # the new window by diffing against the snapshot, not by PID.
+    # created by an already-running Vivaldi instance — identify the new
+    # window by diffing against the snapshot, not by PID.
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         current = find_windows(display, wm_class)
         new = current - existing
         if new:
             for wid in new:
-                apply_icon(display, wid, icon_data)
+                if wants_icon:
+                    apply_icon(display, wid, icon_data)
+                if sticky:
+                    apply_sticky(display, wid)
             break
         time.sleep(0.1)
 

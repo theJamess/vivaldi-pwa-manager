@@ -556,32 +556,69 @@ def resolve_icon_to_file(icon_field: str, app_id: str = "") -> str:
 
 
 def peel_icon_wrapper(exec_line: str):
-    """If exec_line invokes vivaldi-pwa-icon-wrap, return (icon, wmclass, inner).
-    Otherwise (None, None, exec_line)."""
+    """If exec_line invokes vivaldi-pwa-icon-wrap, return a dict
+    {icon, wm_class, sticky, inner}. Otherwise
+    {icon: '', wm_class: '', sticky: False, inner: exec_line}.
+
+    Handles both the new flag form (--class X [--icon P] [--sticky] -- cmd)
+    and the legacy positional form (<icon> <class> -- cmd)."""
+    blank = {"icon": "", "wm_class": "", "sticky": False, "inner": exec_line}
     if not exec_line:
-        return None, None, exec_line
+        return blank
     try:
         tokens = shlex.split(exec_line)
     except ValueError:
-        return None, None, exec_line
-    if not tokens:
-        return None, None, exec_line
-    if os.path.basename(tokens[0]) != WRAPPER_NAME:
-        return None, None, exec_line
-    if len(tokens) < 5 or tokens[3] != "--":
-        return None, None, exec_line
-    icon, wmclass = tokens[1], tokens[2]
-    inner = " ".join(_quote_token(t) for t in tokens[4:])
-    return icon, wmclass, inner
+        return blank
+    if not tokens or os.path.basename(tokens[0]) != WRAPPER_NAME:
+        return blank
+
+    args = tokens[1:]
+    if args and args[0].startswith("--"):
+        # Flag form
+        icon, wm_class, sticky = "", "", False
+        cmd_idx = None
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            if tok == "--":
+                cmd_idx = i + 1
+                break
+            if tok == "--class" and i + 1 < len(args):
+                wm_class = args[i + 1]; i += 2
+            elif tok == "--icon" and i + 1 < len(args):
+                icon = args[i + 1]; i += 2
+            elif tok == "--sticky":
+                sticky = True; i += 1
+            else:
+                return blank  # unknown flag — bail
+        if cmd_idx is None or cmd_idx >= len(args):
+            return blank
+        inner = " ".join(_quote_token(t) for t in args[cmd_idx:])
+        return {"icon": icon, "wm_class": wm_class,
+                "sticky": sticky, "inner": inner}
+
+    # Legacy positional form: <icon> <class> -- <cmd>
+    if len(args) < 4 or args[2] != "--":
+        return blank
+    inner = " ".join(_quote_token(t) for t in args[3:])
+    return {"icon": args[0], "wm_class": args[1],
+            "sticky": False, "inner": inner}
 
 
-def wrap_with_icon_helper(exec_line: str, icon_path: str, wm_class: str) -> str:
+def wrap_with_icon_helper(exec_line: str, icon_path: str, wm_class: str,
+                          sticky: bool = False) -> str:
+    """Build an Exec line that invokes vivaldi-pwa-icon-wrap in flag form.
+    Either icon_path or sticky (or both) should be set — the helper does
+    nothing useful if neither is present."""
     wrapper = str(installed_wrapper_path())
-    return (
-        f"{shlex.quote(wrapper)} "
-        f"{shlex.quote(icon_path)} "
-        f"{shlex.quote(wm_class)} -- {exec_line}"
-    )
+    parts = [shlex.quote(wrapper), "--class", shlex.quote(wm_class)]
+    if icon_path:
+        parts += ["--icon", shlex.quote(icon_path)]
+    if sticky:
+        parts.append("--sticky")
+    parts.append("--")
+    parts.append(exec_line)
+    return " ".join(parts)
 
 
 # ---------- Icon fetching from a URL ----------
@@ -1218,6 +1255,15 @@ class PWAManager(Gtk.Window):
         )
         win_box.pack_start(self.cb_icon_override, False, False, 0)
 
+        self.cb_sticky = Gtk.CheckButton(
+            label="Visible on all workspaces (sticky)")
+        self.cb_sticky.set_tooltip_text(
+            "After launch, set _NET_WM_STATE_STICKY so the window appears on "
+            "every Cinnamon workspace. Shares the same helper as the icon "
+            "override — needs python3-xlib. X11 only."
+        )
+        win_box.pack_start(self.cb_sticky, False, False, 0)
+
         # ---- Profile & Privacy ----
         priv_exp = Gtk.Expander(label="Profile & Privacy")
         right.pack_start(priv_exp, False, False, 0)
@@ -1451,15 +1497,17 @@ class PWAManager(Gtk.Window):
 
         self._set_detail_sensitive(True, orphan=False)
         raw_exec = d.get("exec", "")
-        wrap_icon, wrap_class, inner_exec = peel_icon_wrapper(raw_exec)
-        m = parse_exec(inner_exec)
+        wrap = peel_icon_wrapper(raw_exec)
+        m = parse_exec(wrap["inner"])
         self.name_entry.set_text(d.get("name", ""))
         self.icon_entry.set_text(d.get("icon", ""))
         self.url_entry.set_text(d.get("url", ""))
         self.appid_entry.set_text(d.get("app_id", ""))
-        self.wmclass_entry.set_text(d.get("wmclass") or wrap_class or m.get("wm_class", ""))
+        self.wmclass_entry.set_text(
+            d.get("wmclass") or wrap["wm_class"] or m.get("wm_class", ""))
         self.exec_entry.set_text(m["core"])
-        self.cb_icon_override.set_active(wrap_icon is not None)
+        self.cb_icon_override.set_active(bool(wrap["icon"]))
+        self.cb_sticky.set_active(wrap["sticky"])
         self.path_lbl.set_text(d.get("path", ""))
         self.subtitle_lbl.set_text(self._subtitle_for(d))
         # Kind combo (block handler to avoid Exec reshape on load)
@@ -1508,9 +1556,9 @@ class PWAManager(Gtk.Window):
                   self.udd_entry, self.lang_entry, self.proxy_entry, self.categories_entry,
                   self.keywords_entry, self.mimetype_entry, self.comment_entry, self.extras_entry):
             w.set_text("")
-        for cb in (self.cb_single_main, self.cb_icon_override, self.cb_isolated,
-                   self.cb_incognito, self.cb_no_ext, self.cb_pwstore,
-                   self.cb_dark, self.cb_no_display):
+        for cb in (self.cb_single_main, self.cb_icon_override, self.cb_sticky,
+                   self.cb_isolated, self.cb_incognito, self.cb_no_ext,
+                   self.cb_pwstore, self.cb_dark, self.cb_no_display):
             cb.set_active(False)
         self.rb_default.set_active(True)
         self.kind_combo.handler_block_by_func(self._on_kind_changed)
@@ -1528,7 +1576,7 @@ class PWAManager(Gtk.Window):
             self.rb_default, self.rb_max, self.rb_full,
             self.cb_single_main, self.cb_isolated, self.cb_incognito, self.cb_no_ext,
             self.cb_pwstore, self.cb_dark, self.cb_no_display, self.cb_icon_override,
-            self.kind_combo,
+            self.cb_sticky, self.kind_combo,
         ]
         for w in widgets:
             w.set_sensitive(on)
@@ -2837,8 +2885,8 @@ class PWAManager(Gtk.Window):
         new_exec = build_exec(core, model, self.extras_entry.get_text(),
                               self.wmclass_entry.get_text().strip())
         ensure_isolated_profile_dir(model["user_data_dir"])
-        if self.cb_icon_override.get_active():
-            wrapped = self._apply_icon_wrapper(new_exec)
+        if self.cb_icon_override.get_active() or self.cb_sticky.get_active():
+            wrapped = self._apply_window_wrapper(new_exec)
             if wrapped is None:
                 return  # error already shown
             new_exec = wrapped
@@ -2882,26 +2930,34 @@ class PWAManager(Gtk.Window):
         self.refresh()
         self._reselect(str(path))
 
-    def _apply_icon_wrapper(self, exec_line):
-        """Resolve the icon, install the helper if needed, and return a wrapped
-        Exec line. Returns None and shows an error if any precondition fails."""
+    def _apply_window_wrapper(self, exec_line):
+        """Wrap the Exec in vivaldi-pwa-icon-wrap, applying whatever subset of
+        {icon override, sticky} the checkboxes ask for. Returns None and
+        shows an error if any precondition fails."""
+        want_icon = self.cb_icon_override.get_active()
+        want_sticky = self.cb_sticky.get_active()
+        if not (want_icon or want_sticky):
+            return exec_line  # nothing to do; shouldn't happen but be safe
         if not icon_helpers_available():
             self._error(
-                "Window-icon override needs python-xlib.\n"
+                "Window wrapper needs python-xlib.\n"
                 "Install it via:\n  sudo apt install python3-xlib\n"
                 "(or pip install python-xlib in your environment)"
             )
             return None
-        icon_path = resolve_icon_to_file(
-            self.icon_entry.get_text().strip(),
-            self.appid_entry.get_text().strip(),
-        )
-        if not icon_path:
-            self._error(
-                "Couldn't resolve Icon to a real file. Set Icon to an absolute "
-                "path (use the Browse button) before enabling the override."
+        icon_path = ""
+        if want_icon:
+            icon_path = resolve_icon_to_file(
+                self.icon_entry.get_text().strip(),
+                self.appid_entry.get_text().strip(),
             )
-            return None
+            if not icon_path:
+                self._error(
+                    "Couldn't resolve Icon to a real file. Set Icon to an "
+                    "absolute path (use the Browse button) before enabling "
+                    "the icon override."
+                )
+                return None
         wm_class = (self.wmclass_entry.get_text().strip()
                     or self.name_entry.get_text().strip()
                     or "Vivaldi")
@@ -2910,7 +2966,8 @@ class PWAManager(Gtk.Window):
         except Exception as e:
             self._error(f"Could not install helper script: {e}")
             return None
-        return wrap_with_icon_helper(exec_line, icon_path, wm_class)
+        return wrap_with_icon_helper(
+            exec_line, icon_path, wm_class, sticky=want_sticky)
 
     def _set_or_clear(self, sec, key, value):
         if value:
