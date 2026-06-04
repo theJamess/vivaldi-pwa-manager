@@ -2041,6 +2041,10 @@ class PWAManager(Gtk.Window):
             "color": None,            # Gdk.RGBA, or None to mean "no tint"
             "selected_info": None,    # Gtk.IconInfo for theme icons
             "debounce_id": 0,
+            # Lazy-tinting state: tiles awaiting tinting + a generation counter
+            # that invalidates in-flight idle callbacks when the colour changes.
+            "pending_tint": [],
+            "tint_generation": 0,
         }
 
         # --- Tile factories ---
@@ -2209,6 +2213,10 @@ class PWAManager(Gtk.Window):
             except ValueError:
                 sz = 48
 
+            # Bump the tint generation: any in-flight idle tinters checking
+            # for this number will see it changed and abort.
+            state["tint_generation"] += 1
+            state["pending_tint"] = []
             tint_note = (f"  ·  tinted {rgba_to_hex(state['color'])}"
                          if state["color"] is not None else "")
             if state["folder"]:
@@ -2219,9 +2227,14 @@ class PWAManager(Gtk.Window):
                 ]
                 cap = 240
                 for path in matches[:cap]:
-                    tile = make_file_icon_tile(path, sz, color=state["color"])
+                    # Build the tile with NATIVE colours — fast — then queue
+                    # for background tinting if a colour is active.
+                    tile = make_file_icon_tile(path, sz)
                     if tile is not None:
                         flow.add(tile)
+                        if state["color"] is not None:
+                            state["pending_tint"].append(
+                                (tile, path, "file", sz))
                 cap_note = f" (showing first {cap})" if len(matches) > cap else ""
                 if not matches:
                     status.set_text(
@@ -2237,9 +2250,12 @@ class PWAManager(Gtk.Window):
                 matches = [n for n in source if q in n.lower()] if q else source
                 cap = 240
                 for name in matches[:cap]:
-                    tile = make_theme_icon_tile(name, sz, color=state["color"])
+                    tile = make_theme_icon_tile(name, sz)
                     if tile is not None:
                         flow.add(tile)
+                        if state["color"] is not None:
+                            state["pending_tint"].append(
+                                (tile, name, "theme", sz))
                 cap_note = f" (showing first {cap})" if len(matches) > cap else ""
                 scope = f" in {cat}" if cat else ""
                 if not matches:
@@ -2252,7 +2268,62 @@ class PWAManager(Gtk.Window):
                     status.set_text(
                         f"All icons in {cat}: {len(matches)}{cap_note}{tint_note}.")
             flow.show_all()
+            if state["pending_tint"]:
+                GLib.idle_add(tint_next_batch)
             return False
+
+        # ---- Lazy tinter: prioritise visible tiles, work in batches ----
+
+        def is_tile_visible(tile):
+            alloc = tile.get_allocation()
+            if alloc.height <= 0:
+                return False  # not yet allocated
+            # Tile's allocation is in FlowBox coords; FlowBox is inside the
+            # scrolled window's viewport.
+            adj = sw.get_vadjustment()
+            top = adj.get_value()
+            bot = top + adj.get_page_size()
+            tile_top = alloc.y
+            tile_bot = alloc.y + alloc.height
+            return tile_bot >= top and tile_top <= bot
+
+        def _swap_tile_image(tile, pix):
+            for child in tile.get_children():
+                if isinstance(child, Gtk.Image):
+                    child.set_from_pixbuf(pix)
+                    return
+
+        def _render_tinted(value, kind, sz):
+            if kind == "theme":
+                info = theme.lookup_icon(value, sz, 0)
+                return _tinted_theme_pix(info, sz, state["color"]) \
+                    if info else None
+            return _tinted_file_pix(value, sz, state["color"])
+
+        def tint_next_batch():
+            if state["color"] is None or not state["pending_tint"]:
+                return False
+            gen = state["tint_generation"]
+            visible, offscreen = [], []
+            for entry in state["pending_tint"]:
+                if is_tile_visible(entry[0]):
+                    visible.append(entry)
+                else:
+                    offscreen.append(entry)
+            batch = visible[:8] if visible else offscreen[:4]
+            for entry in batch:
+                if state["tint_generation"] != gen \
+                        or state["color"] is None:
+                    return False
+                tile, value, kind, sz = entry
+                pix = _render_tinted(value, kind, sz)
+                if pix is not None:
+                    _swap_tile_image(tile, pix)
+                try:
+                    state["pending_tint"].remove(entry)
+                except ValueError:
+                    pass
+            return bool(state["pending_tint"])
 
         # --- Preview / color ---
         def selected_source_svg_path():
@@ -2404,14 +2475,63 @@ class PWAManager(Gtk.Window):
         def on_color_set(_btn):
             state["color"] = color_btn.get_rgba()
             update_preview()
-            # Re-render the grid so the user sees every tintable icon in the
-            # chosen colour while browsing — not just the preview pane.
-            populate()
+            # Re-queue every visible tile for lazy tinting in the new colour,
+            # without rebuilding the grid from scratch.
+            _requeue_for_tint()
 
         def on_color_clear(_btn):
             state["color"] = None
             update_preview()
-            populate()
+            # Color cleared — repaint every tile back to its native colours.
+            _requeue_for_native()
+
+        def _requeue_for_tint():
+            state["tint_generation"] += 1
+            state["pending_tint"] = []
+            try:
+                sz = int(size_combo.get_active_id() or "48")
+            except ValueError:
+                sz = 48
+            for child in flow.get_children():
+                tile = child.get_child()
+                kind = getattr(tile, "_kind", None)
+                value = getattr(tile, "_value", None)
+                if kind in ("theme", "file") and value:
+                    state["pending_tint"].append((tile, value, kind, sz))
+            if state["pending_tint"]:
+                GLib.idle_add(tint_next_batch)
+
+        def _requeue_for_native():
+            state["tint_generation"] += 1
+            state["pending_tint"] = []
+            try:
+                sz = int(size_combo.get_active_id() or "48")
+            except ValueError:
+                sz = 48
+            # Repaint each tile with its native pix (fast — no SVG fiddling)
+            for child in flow.get_children():
+                tile = child.get_child()
+                kind = getattr(tile, "_kind", None)
+                value = getattr(tile, "_value", None)
+                if kind == "theme" and value:
+                    info = theme.lookup_icon(value, sz, 0)
+                    if not info:
+                        continue
+                    try:
+                        pix = info.load_icon()
+                        if pix.get_width() != sz or pix.get_height() != sz:
+                            pix = pix.scale_simple(
+                                sz, sz, GdkPixbuf.InterpType.BILINEAR)
+                        _swap_tile_image(tile, pix)
+                    except Exception:
+                        pass
+                elif kind == "file" and value:
+                    try:
+                        pix = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                            value, sz, sz)
+                        _swap_tile_image(tile, pix)
+                    except Exception:
+                        pass
 
         search_entry.connect("changed", schedule_search)
         size_combo.connect("changed", schedule_search)
@@ -2422,6 +2542,12 @@ class PWAManager(Gtk.Window):
         rb_folder.connect("toggled", on_mode_changed)
         color_btn.connect("color-set", on_color_set)
         color_clear.connect("clicked", on_color_clear)
+        # On scroll, wake the lazy tinter so newly-visible tiles get done first
+        sw.get_vadjustment().connect(
+            "value-changed",
+            lambda *_: GLib.idle_add(tint_next_batch) if state["pending_tint"]
+            else None,
+        )
 
         current = self.icon_entry.get_text().strip()
         if current and not os.path.isabs(current):
