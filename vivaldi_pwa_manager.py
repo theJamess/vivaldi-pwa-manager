@@ -156,6 +156,10 @@ def parse_desktop(path: Path):
         "no_display": sec.get("NoDisplay", "").lower() == "true",
         "type": sec.get("Type", "Application"),
         "terminal": sec.get("Terminal", "false"),
+        # X-WebApp-URL is set by Mint's Web App Manager and survives our
+        # round-trip. Used as a URL fallback when the user's tinkering blows
+        # the URL out of the Exec line.
+        "x_webapp_url": sec.get("X-WebApp-URL", ""),
         "_cp": cp,
         "_had_shebang": had_shebang,
     }
@@ -356,6 +360,18 @@ def detect_kind(exec_line: str, app_id: str, app_url: str) -> str:
     return "vivaldi"
 
 
+_EXEC_RESERVED = set(' \t\n"\'\\<>~|&;$*?#()`')
+
+
+def quote_exec_arg(s: str) -> str:
+    """Quote a value for safe inclusion in a .desktop Exec line (XDG rules:
+    double quotes, with backslash-escaped \\ and \")."""
+    if not s or not any(c in _EXEC_RESERVED for c in s):
+        return s
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def build_core_for_kind(kind: str, binary: str, app_id: str, url: str) -> str:
     """Build the 'core' Exec (binary + identity flags + URL). WMClass and
     --user-data-dir are added later by build_exec() from the form state.
@@ -365,12 +381,11 @@ def build_core_for_kind(kind: str, binary: str, app_id: str, url: str) -> str:
         tail = f" --profile-directory=Default --app-id={app_id}" if app_id else ""
         return binary + tail
     if kind == "webapp":
-        tail = f' --app="{url}"' if url else ""
-        return binary + tail
+        return binary + (f" --app={quote_exec_arg(url)}" if url else "")
     if kind == "sandboxed":
         parts = [binary, "--no-first-run", "--no-default-browser-check"]
         if url:
-            parts.append(url)
+            parts.append(quote_exec_arg(url))
         return " ".join(parts)
     return binary
 
@@ -387,7 +402,7 @@ def discover_launchers():
             continue
         d["app_id"] = extract_app_id(d["exec"])
         app_url = extract_app_url(d["exec"])
-        d["url"] = app_url or extract_positional_url(d["exec"])
+        d["url"] = app_url or extract_positional_url(d["exec"]) or d.get("x_webapp_url", "")
         d["kind"] = detect_kind(d["exec"], d["app_id"], app_url)
         items.append(d)
     return items
@@ -1016,47 +1031,72 @@ class PWAManager(Gtk.Window):
             self.icon_img.set_from_icon_name("application-x-executable", Gtk.IconSize.DIALOG)
 
     def _on_isolated_toggled(self, cb):
+        auto = isolated_profile_path_for(
+            self.wmclass_entry.get_text(),
+            self.appid_entry.get_text(),
+        )
         if cb.get_active():
-            path = isolated_profile_path_for(
-                self.wmclass_entry.get_text(),
-                self.appid_entry.get_text(),
-            )
-            self.udd_entry.set_text(path)
+            # Only fill in the auto-path if udd is currently empty. Never
+            # overwrite a path the user (or another tool) put there.
+            if not self.udd_entry.get_text().strip():
+                self.udd_entry.set_text(auto)
         else:
-            # only clear if it matches the auto-generated path
-            current = self.udd_entry.get_text()
-            auto = isolated_profile_path_for(
-                self.wmclass_entry.get_text(),
-                self.appid_entry.get_text(),
-            )
-            if current == auto:
+            # Only clear if it matches the auto-generated path
+            if self.udd_entry.get_text() == auto:
                 self.udd_entry.set_text("")
 
     # ---- kind switching ----
     def _on_kind_changed(self, _combo):
-        """Reshape Exec for the newly-chosen kind, preserving URL / app-id."""
+        """Reshape Exec for the newly-chosen kind, preserving URL / app-id.
+        If required data is missing, show an error and revert the dropdown
+        instead of silently writing a broken Exec."""
         if not self.current or self.current.get("_orphan"):
             return
         new_kind = self.kind_combo.get_active_id() or "vivaldi"
         if new_kind == "vivaldi":
             return
-        # Figure out the binary from the existing core
+        prev_kind = self.current.get("kind", "vivaldi")
+        url = self.url_entry.get_text().strip() or self.current.get("url", "")
+        app_id = self.appid_entry.get_text().strip()
+
+        # Prerequisite checks
+        problem = None
+        if new_kind == "pwa" and not app_id:
+            problem = ("Switching to PWA needs a Chromium app-id, and this "
+                       "launcher doesn't have one. PWAs come from Vivaldi "
+                       "installing a site as an app — pick an orphan PWA "
+                       "from the list, or change this launcher to a Web App "
+                       "or Sandboxed window instead.")
+        elif new_kind in ("webapp", "sandboxed") and not url:
+            problem = (f"Switching to {dict(KIND_LABELS)[new_kind]} needs a "
+                       "URL. Fill in the URL field above first, then change "
+                       "the Kind dropdown.")
+        if problem:
+            self._error(problem)
+            # Revert the dropdown without re-triggering this handler
+            self.kind_combo.handler_block_by_func(self._on_kind_changed)
+            self.kind_combo.set_active_id(prev_kind)
+            self.kind_combo.handler_unblock_by_func(self._on_kind_changed)
+            return
+
+        # Make sure the form's URL field reflects what we'll actually use.
+        if url and self.url_entry.get_text().strip() != url:
+            self.url_entry.set_text(url)
+
         core_tokens = shlex.split(self.exec_entry.get_text() or "")
         binary = core_tokens[0] if core_tokens else DEFAULT_BINARY
-        url = self.url_entry.get_text().strip()
-        app_id = self.appid_entry.get_text().strip()
-        if new_kind in ("webapp", "sandboxed") and not url and self.current.get("url"):
-            url = self.current["url"]
-            self.url_entry.set_text(url)
         new_core = build_core_for_kind(new_kind, binary, app_id, url)
         self.exec_entry.set_text(new_core)
-        # Sandboxed feels broken without an isolated profile + WM class
+
         if new_kind == "sandboxed":
             if not self.wmclass_entry.get_text().strip() and self.current.get("name"):
                 slug = re.sub(r"[^A-Za-z0-9]+", "",
                               self.current["name"]) or "VivaldiApp"
                 self.wmclass_entry.set_text(slug)
-            if not self.cb_isolated.get_active():
+            # Only auto-isolate if there's no profile dir yet — don't silently
+            # overwrite an existing --user-data-dir and lose the user's state.
+            if (not self.cb_isolated.get_active()
+                    and not self.udd_entry.get_text().strip()):
                 self.cb_isolated.set_active(True)
         self.subtitle_lbl.set_text(self._subtitle_for_kind(new_kind, app_id, url))
 
