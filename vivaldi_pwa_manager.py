@@ -12,12 +12,18 @@ Save semantics:
   holds the "core" command (binary + --profile-directory + --app-id/--app).
 """
 
+import json
 import os
 import re
 import shlex
 import shutil
+import ssl
 import subprocess
+import tempfile
+import urllib.parse
+import urllib.request
 from configparser import RawConfigParser
+from html.parser import HTMLParser
 from io import StringIO
 from pathlib import Path
 
@@ -34,6 +40,11 @@ ISOLATED_PROFILES_ROOT = Path.home() / ".local/share/vivaldi-pwa-profiles"
 WRAPPER_NAME = "vivaldi-pwa-icon-wrap"
 WRAPPER_INSTALL_DIR = Path.home() / ".local/bin"
 WRAPPER_SOURCE = Path(__file__).resolve().parent / WRAPPER_NAME
+
+FETCHED_ICONS_DIR = Path.home() / ".local/share/vivaldi-pwa-icons"
+HTTP_TIMEOUT = 10
+HTTP_USER_AGENT = "Mozilla/5.0 vivaldi-pwa-manager/1.0"
+MAX_ICON_BYTES = 4 * 1024 * 1024  # 4 MB per icon; refuse anything wilder
 
 VIVALDI_BINARIES = ("vivaldi", "vivaldi-stable", "/opt/vivaldi/vivaldi")
 
@@ -565,6 +576,184 @@ def wrap_with_icon_helper(exec_line: str, icon_path: str, wm_class: str) -> str:
     )
 
 
+# ---------- Icon fetching from a URL ----------
+
+
+def _http_get(url, allow_insecure=False, max_bytes=MAX_ICON_BYTES):
+    """Fetch URL with our user-agent + TLS-tolerance flag. Returns
+    (content_type, bytes). Raises RuntimeError on error or oversize."""
+    req = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
+    ctx = ssl.create_default_context()
+    if allow_insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as r:
+            ct = r.headers.get("Content-Type", "")
+            data = r.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise RuntimeError(f"Response exceeded {max_bytes} bytes")
+            return ct, data
+    except urllib.error.URLError as e:
+        raise RuntimeError(str(e.reason if hasattr(e, "reason") else e)) from e
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
+
+
+class _IconLinkExtractor(HTMLParser):
+    """Scrape <link rel=icon/apple-touch-icon/manifest …> from a page head."""
+    ICON_RELS = {
+        "icon", "shortcut icon", "apple-touch-icon",
+        "apple-touch-icon-precomposed", "mask-icon", "fluid-icon",
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.icons = []
+        self.manifest_url = None
+        self.og_image = None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "link":
+            rel = a.get("rel", "").lower().strip()
+            href = a.get("href", "")
+            if not href:
+                return
+            if rel == "manifest":
+                self.manifest_url = href
+            elif rel in self.ICON_RELS or any(r in self.ICON_RELS for r in rel.split()):
+                self.icons.append({
+                    "href": href,
+                    "sizes": a.get("sizes", ""),
+                    "type": a.get("type", ""),
+                })
+        elif tag == "meta":
+            prop = (a.get("property") or a.get("name") or "").lower()
+            if prop == "og:image":
+                self.og_image = a.get("content", "")
+
+
+def discover_icon_candidates(url, allow_insecure=False):
+    """Given a page URL, return a list of icon candidate dicts with keys:
+    href (absolute URL), sizes, type, source ('page' / 'manifest' / 'meta' /
+    'fallback'). Manifest icons are followed when a <link rel=manifest> is
+    present. Always appends /favicon.ico as a last-ditch fallback."""
+    candidates = []
+    try:
+        ct, body = _http_get(url, allow_insecure)
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch {url}: {e}") from e
+
+    text = ""
+    if "html" in ct.lower() or "text" in ct.lower() or not ct:
+        try:
+            text = body.decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+    if text:
+        ex = _IconLinkExtractor()
+        try:
+            ex.feed(text)
+        except Exception:
+            pass
+        for i in ex.icons:
+            candidates.append({
+                "href": urllib.parse.urljoin(url, i["href"]),
+                "sizes": i["sizes"],
+                "type": i["type"],
+                "source": "page",
+            })
+        if ex.manifest_url:
+            mu = urllib.parse.urljoin(url, ex.manifest_url)
+            try:
+                _, mbody = _http_get(mu, allow_insecure)
+                manifest = json.loads(mbody.decode("utf-8", errors="replace"))
+            except Exception:
+                manifest = None
+            if isinstance(manifest, dict):
+                for ic in manifest.get("icons", []) or []:
+                    src = ic.get("src", "")
+                    if not src:
+                        continue
+                    candidates.append({
+                        "href": urllib.parse.urljoin(mu, src),
+                        "sizes": ic.get("sizes", ""),
+                        "type": ic.get("type", ""),
+                        "source": "manifest",
+                    })
+        if ex.og_image:
+            candidates.append({
+                "href": urllib.parse.urljoin(url, ex.og_image),
+                "sizes": "",
+                "type": "",
+                "source": "og:image",
+            })
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        favicon = f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+        candidates.append({
+            "href": favicon,
+            "sizes": "",
+            "type": "image/x-icon",
+            "source": "fallback",
+        })
+
+    seen, deduped = set(), []
+    for c in candidates:
+        if c["href"] not in seen:
+            seen.add(c["href"])
+            deduped.append(c)
+    return deduped
+
+
+def _size_score(sizes_str):
+    """Rough sort key: bigger declared sizes win."""
+    if not sizes_str:
+        return 0
+    best = 0
+    for token in sizes_str.lower().split():
+        if "x" in token:
+            try:
+                w, h = token.split("x", 1)
+                best = max(best, int(w) * int(h))
+            except ValueError:
+                pass
+    return best
+
+
+def rank_candidates(cands):
+    """Sort candidates roughly best-first: manifest > page-link > og:image >
+    fallback, then by declared size descending."""
+    src_rank = {"manifest": 3, "page": 2, "og:image": 1, "fallback": 0}
+    return sorted(
+        cands,
+        key=lambda c: (src_rank.get(c["source"], 0), _size_score(c["sizes"])),
+        reverse=True,
+    )
+
+
+def save_fetched_icon(body, src_href, slug):
+    """Write bytes to FETCHED_ICONS_DIR/<slug>.<ext>, picking a non-clashing
+    name. Returns the absolute destination path."""
+    FETCHED_ICONS_DIR.mkdir(parents=True, exist_ok=True)
+    ext = ".png"
+    path = urllib.parse.urlparse(src_href).path
+    for cand in (".svg", ".ico", ".webp", ".jpg", ".jpeg", ".png"):
+        if path.lower().endswith(cand):
+            ext = cand
+            break
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", slug).strip("-").lower() or "icon"
+    dest = FETCHED_ICONS_DIR / f"{slug}{ext}"
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = FETCHED_ICONS_DIR / f"{slug}-{n}{ext}"
+    dest.write_bytes(body)
+    return str(dest)
+
+
 # ---------- UI ----------
 
 class PWAManager(Gtk.Window):
@@ -657,10 +846,16 @@ class PWAManager(Gtk.Window):
             widget.set_hexpand(True)
 
         self.icon_entry = Gtk.Entry(placeholder_text="Icon name or absolute path")
+        icon_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         icon_btn = Gtk.Button.new_from_icon_name("document-open-symbolic", Gtk.IconSize.BUTTON)
         icon_btn.set_tooltip_text("Browse for icon file")
         icon_btn.connect("clicked", self._browse_icon)
-        add_row(1, "Icon", self.icon_entry, icon_btn)
+        fetch_btn = Gtk.Button.new_from_icon_name("emblem-downloads-symbolic", Gtk.IconSize.BUTTON)
+        fetch_btn.set_tooltip_text("Fetch icons from a URL")
+        fetch_btn.connect("clicked", lambda *_: self._fetch_icons_dialog())
+        icon_btns.pack_start(icon_btn, False, False, 0)
+        icon_btns.pack_start(fetch_btn, False, False, 0)
+        add_row(1, "Icon", self.icon_entry, icon_btns)
 
         self.kind_combo = Gtk.ComboBoxText()
         for k, label in KIND_LABELS:
@@ -1138,44 +1333,74 @@ class PWAManager(Gtk.Window):
     def _new_launcher(self):
         dlg = Gtk.Dialog(title="New launcher", transient_for=self, modal=True)
         dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dlg.add_button("Create", Gtk.ResponseType.OK)
+        ok_btn = dlg.add_button("Create", Gtk.ResponseType.OK)
         box = dlg.get_content_area()
         box.set_spacing(6); box.set_margin_top(8)
         box.set_margin_start(10); box.set_margin_end(10); box.set_margin_bottom(8)
         grid = Gtk.Grid(column_spacing=8, row_spacing=6)
         kind_combo = Gtk.ComboBoxText()
+        kind_combo.append("vivaldi-install", "Install via Vivaldi  (recommended for PWAs)")
         kind_combo.append("sandboxed", "Sandboxed window  (full chrome, isolated profile)")
-        kind_combo.append("webapp", "Web App  (--app=URL, no chrome)")
-        kind_combo.set_active_id("sandboxed")
+        kind_combo.append("webapp", "Web App  (chromeless --app=URL)")
+        kind_combo.set_active_id("vivaldi-install")
         name_e = Gtk.Entry(placeholder_text="e.g. Portainer")
         url_e = Gtk.Entry(placeholder_text="https://…")
         icon_e = Gtk.Entry(placeholder_text="Icon name or path (optional)")
+        labels = {}
         rows = (("Kind", kind_combo), ("Name", name_e), ("URL", url_e), ("Icon", icon_e))
-        for r, (lbl, w) in enumerate(rows):
-            grid.attach(Gtk.Label(label=lbl, xalign=1), 0, r, 1, 1)
+        for r, (text, w) in enumerate(rows):
+            lbl = Gtk.Label(label=text, xalign=1)
+            grid.attach(lbl, 0, r, 1, 1)
             grid.attach(w, 1, r, 1, 1)
             w.set_hexpand(True)
+            labels[text] = lbl
         box.pack_start(grid, False, False, 0)
 
         note = Gtk.Label(xalign=0)
         note.set_line_wrap(True)
         note.get_style_context().add_class("dim-label")
+        box.pack_start(note, False, False, 0)
 
-        def update_note(*_):
-            if kind_combo.get_active_id() == "sandboxed":
+        def update_for_kind(*_):
+            k = kind_combo.get_active_id()
+            if k == "vivaldi-install":
+                note.set_text(
+                    "Opens the URL in Vivaldi. From there, use "
+                    "Menu → Install Page as Web App (or the install icon in "
+                    "the address bar). Vivaldi handles the manifest, icons, "
+                    "extensions, and per-app settings. After installing, "
+                    "click Refresh in this manager and the new PWA shows up."
+                )
+                ok_btn.set_label("Open in Vivaldi")
+                for w in (name_e, icon_e):
+                    w.set_sensitive(False)
+                labels["Name"].set_sensitive(False)
+                labels["Icon"].set_sensitive(False)
+            elif k == "sandboxed":
                 note.set_text(
                     "Sandboxed: full Vivaldi window (tabs + address bar) with "
                     "its own Chromium profile and WM class. Pinned as a "
                     "separate app in the taskbar."
                 )
+                ok_btn.set_label("Create")
+                for w in (name_e, icon_e):
+                    w.set_sensitive(True)
+                labels["Name"].set_sensitive(True)
+                labels["Icon"].set_sensitive(True)
             else:
                 note.set_text(
                     "Web App: chromeless --app=URL window. No tabs, no "
-                    "address bar. Vivaldi has to be installed and on PATH."
+                    "address bar. Quickest way to app-ify a URL without "
+                    "touching Vivaldi."
                 )
-        update_note()
-        kind_combo.connect("changed", update_note)
-        box.pack_start(note, False, False, 0)
+                ok_btn.set_label("Create")
+                for w in (name_e, icon_e):
+                    w.set_sensitive(True)
+                labels["Name"].set_sensitive(True)
+                labels["Icon"].set_sensitive(True)
+
+        update_for_kind()
+        kind_combo.connect("changed", update_for_kind)
 
         dlg.show_all()
         if dlg.run() == Gtk.ResponseType.OK:
@@ -1184,6 +1409,31 @@ class PWAManager(Gtk.Window):
             url = url_e.get_text().strip()
             icon = icon_e.get_text().strip()
             dlg.destroy()
+            if kind == "vivaldi-install":
+                if not url:
+                    self._error("URL is required.")
+                    return
+                if not url.startswith(("http://", "https://")):
+                    url = "https://" + url
+                try:
+                    subprocess.Popen([DEFAULT_BINARY, url], start_new_session=True)
+                except Exception as e:
+                    self._error(f"Couldn't open Vivaldi: {e}")
+                    return
+                info = Gtk.MessageDialog(
+                    transient_for=self, message_type=Gtk.MessageType.INFO,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="Install this page as a PWA in Vivaldi",
+                )
+                info.format_secondary_text(
+                    "Use Vivaldi's Menu → Install Page as Web App, or click "
+                    "the install icon in the address bar.\n\n"
+                    "Once installed, click Refresh in this manager and the "
+                    "new PWA will show up (as a launcher or an orphan you "
+                    "can promote)."
+                )
+                info.run(); info.destroy()
+                return
             if not name or not url:
                 self._error("Name and URL are required.")
                 return
@@ -1310,6 +1560,156 @@ class PWAManager(Gtk.Window):
             self._set_status("Opened vivaldi://apps")
         except Exception as e:
             self._error(f"Couldn't launch Vivaldi: {e}")
+
+    # ---- icon fetch from URL ----
+    def _fetch_icons_dialog(self):
+        dlg = Gtk.Dialog(title="Fetch icons", transient_for=self, modal=True)
+        dlg.set_default_size(700, 520)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        use_btn = dlg.add_button("Use selected", Gtk.ResponseType.OK)
+        use_btn.set_sensitive(False)
+
+        box = dlg.get_content_area()
+        box.set_spacing(8); box.set_margin_top(10)
+        box.set_margin_start(10); box.set_margin_end(10); box.set_margin_bottom(10)
+
+        url_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        url_row.pack_start(Gtk.Label(label="Source URL:", xalign=0), False, False, 0)
+        url_entry = Gtk.Entry()
+        url_entry.set_text(self.url_entry.get_text().strip())
+        url_entry.set_placeholder_text(
+            "Page URL with the icons (e.g. portainer.io, github.com/foo/bar)"
+        )
+        url_row.pack_start(url_entry, True, True, 0)
+        fetch_action = Gtk.Button(label="Fetch")
+        url_row.pack_start(fetch_action, False, False, 0)
+        box.pack_start(url_row, False, False, 0)
+
+        insecure_cb = Gtk.CheckButton(label="Ignore TLS errors (use for self-signed certs)")
+        box.pack_start(insecure_cb, False, False, 0)
+
+        status = Gtk.Label(xalign=0)
+        status.get_style_context().add_class("dim-label")
+        box.pack_start(status, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        flow = Gtk.FlowBox()
+        flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        flow.set_max_children_per_line(4)
+        flow.set_min_children_per_line(2)
+        flow.set_homogeneous(True)
+        flow.set_valign(Gtk.Align.START)
+        sw.add(flow)
+        box.pack_start(sw, True, True, 0)
+
+        state = {"href": None, "body": None}
+
+        def clear_flow():
+            for child in flow.get_children():
+                flow.remove(child)
+            state["href"] = None
+            state["body"] = None
+            use_btn.set_sensitive(False)
+
+        def do_fetch(*_):
+            clear_flow()
+            u = url_entry.get_text().strip()
+            if not u:
+                status.set_text("Enter a URL.")
+                return
+            if not u.startswith(("http://", "https://")):
+                u = "https://" + u
+                url_entry.set_text(u)
+            status.set_text(f"Fetching {u} …")
+            # Force a UI redraw before the blocking HTTP work
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            try:
+                cands = discover_icon_candidates(u, insecure_cb.get_active())
+            except Exception as e:
+                status.set_text(f"Fetch failed: {e}")
+                return
+            if not cands:
+                status.set_text("No icon candidates found.")
+                return
+            cands = rank_candidates(cands)[:16]  # cap to keep things sane
+            status.set_text(f"Trying {len(cands)} candidate(s)…")
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+
+            shown = 0
+            for c in cands:
+                try:
+                    _, body = _http_get(c["href"], insecure_cb.get_active())
+                except Exception:
+                    continue
+                # Verify it's a renderable image; skip HTML 404 pages, etc.
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=".img", delete=False, dir=str(FETCHED_ICONS_DIR)
+                    if FETCHED_ICONS_DIR.exists() else None,
+                )
+                tmp.write(body); tmp.close()
+                try:
+                    pix = GdkPixbuf.Pixbuf.new_from_file_at_size(tmp.name, 96, 96)
+                finally:
+                    try:
+                        os.unlink(tmp.name)
+                    except OSError:
+                        pass
+                if not pix:
+                    continue
+
+                tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                tile.set_margin_top(4); tile.set_margin_bottom(4)
+                tile.pack_start(Gtk.Image.new_from_pixbuf(pix), False, False, 0)
+                meta = f"{c['sizes'] or '?'}  ·  {c['source']}"
+                lbl = Gtk.Label(label=meta, xalign=0.5)
+                lbl.get_style_context().add_class("dim-label")
+                tile.pack_start(lbl, False, False, 0)
+                tile._href = c["href"]
+                tile._body = body
+                flow.add(tile)
+                shown += 1
+                while Gtk.events_pending():
+                    Gtk.main_iteration()
+            flow.show_all()
+            status.set_text(
+                f"Found {shown} usable icon(s)."
+                if shown else "Found candidates but none rendered as images."
+            )
+
+        def on_selection(fbox):
+            children = fbox.get_selected_children()
+            if not children:
+                state["href"] = None
+                state["body"] = None
+                use_btn.set_sensitive(False)
+                return
+            tile = children[0].get_child()
+            state["href"] = getattr(tile, "_href", None)
+            state["body"] = getattr(tile, "_body", None)
+            use_btn.set_sensitive(state["body"] is not None)
+
+        fetch_action.connect("clicked", do_fetch)
+        url_entry.connect("activate", do_fetch)
+        flow.connect("selected-children-changed", on_selection)
+
+        # Auto-fetch on open if we have a URL prefilled
+        if url_entry.get_text().strip():
+            GLib.idle_add(do_fetch)
+
+        dlg.show_all()
+        resp = dlg.run()
+        if resp == Gtk.ResponseType.OK and state["body"]:
+            slug = self.name_entry.get_text().strip() or "icon"
+            try:
+                dest = save_fetched_icon(state["body"], state["href"], slug)
+                self.icon_entry.set_text(dest)
+                self._set_status(f"Saved icon → {dest}")
+            except Exception as e:
+                self._error(f"Could not save icon: {e}")
+        dlg.destroy()
 
     # ---- actions ----
     def _browse_icon(self, _btn):
