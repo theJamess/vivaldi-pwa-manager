@@ -799,11 +799,49 @@ def render_recolored_svg(svg_path: str, target_hex: str, size: int):
         return None
 
 
+def _is_pixbuf_monochrome(pix, threshold=20, grid=32):
+    """Sample up to `grid * grid` pixels to decide if the image is
+    monochromatic (R ≈ G ≈ B everywhere). Used to pick the right tinting
+    strategy: monochrome images take an alpha-only tint (so black ink
+    actually turns red instead of staying black), colourful images take a
+    luminance-preserving tint that keeps internal contrast."""
+    if pix.get_n_channels() < 3:
+        return True
+    raw = pix.get_pixels()
+    stride = pix.get_rowstride()
+    n = pix.get_n_channels()
+    has_alpha = n >= 4
+    w, h = pix.get_width(), pix.get_height()
+    step_y = max(1, h // grid)
+    step_x = max(1, w // grid)
+    for y in range(0, h, step_y):
+        base = y * stride
+        for x in range(0, w, step_x):
+            i = base + x * n
+            if has_alpha and raw[i + 3] < 16:
+                continue
+            r, g, b = raw[i], raw[i + 1], raw[i + 2]
+            if (abs(r - g) > threshold
+                    or abs(g - b) > threshold
+                    or abs(r - b) > threshold):
+                return False
+    return True
+
+
 def recolor_raster_pixbuf(src_pix, rgba, target_size=None):
-    """Tint a raster (PNG/JPG/…) pixbuf with `rgba`, modulated by the source
-    pixel's luminance so bright areas stay bright and dark areas stay dark.
-    Preserves alpha. Heavier than load_symbolic / SVG-recolour (per-pixel
-    Python loop), so use for preview + save, not for grid bulk-rendering."""
+    """Tint a raster (PNG/JPG/…) pixbuf with `rgba`.
+
+    For *monochrome* images (black / white / any single-hue artwork on
+    transparency or solid bg): alpha-only tint — every opaque pixel becomes
+    `rgba`, preserving the original alpha for anti-aliased edges. Fixes the
+    "black ink stays black after tinting" failure of a pure luminance-
+    multiply approach (luminance of black is 0 → target × 0 = 0).
+
+    For *colourful* images: luminance-preserving tint — multiplies the target
+    colour by each pixel's Rec. 601 brightness so internal contrasts survive.
+
+    Per-pixel Python loop, so reserve for preview + save, not bulk grid use.
+    """
     if src_pix.get_n_channels() != 4:
         src_pix = src_pix.add_alpha(False, 0, 0, 0)
     if target_size and (
@@ -820,6 +858,7 @@ def recolor_raster_pixbuf(src_pix, rgba, target_size=None):
     tb = int(rgba.blue * 255)
     out = bytearray(raw)
     row_len = w * 4
+    monochrome = _is_pixbuf_monochrome(src_pix)
     for y in range(h):
         base = y * stride
         for x in range(0, row_len, 4):
@@ -827,12 +866,16 @@ def recolor_raster_pixbuf(src_pix, rgba, target_size=None):
             a = out[i + 3]
             if a == 0:
                 continue
-            r, g, b = out[i], out[i + 1], out[i + 2]
-            # Rec. 601 luminance, integer math
-            lum = (299 * r + 587 * g + 114 * b) // 1000
-            out[i] = (tr * lum) // 255
-            out[i + 1] = (tg * lum) // 255
-            out[i + 2] = (tb * lum) // 255
+            if monochrome:
+                out[i] = tr
+                out[i + 1] = tg
+                out[i + 2] = tb
+            else:
+                r, g, b = out[i], out[i + 1], out[i + 2]
+                lum = (299 * r + 587 * g + 114 * b) // 1000
+                out[i] = (tr * lum) // 255
+                out[i + 1] = (tg * lum) // 255
+                out[i + 2] = (tb * lum) // 255
     return GdkPixbuf.Pixbuf.new_from_bytes(
         GLib.Bytes.new(bytes(out)),
         GdkPixbuf.Colorspace.RGB,
