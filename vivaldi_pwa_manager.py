@@ -597,7 +597,7 @@ class PWAManager(Gtk.Window):
             hb.pack_end(b)
         new_btn = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.BUTTON)
         new_btn.set_tooltip_text("New launcher (sandboxed window)")
-        new_btn.connect("clicked", lambda *_: self._new_sandboxed())
+        new_btn.connect("clicked", lambda *_: self._new_launcher())
         hb.pack_start(new_btn)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -834,16 +834,39 @@ class PWAManager(Gtk.Window):
         self.save_btn.connect("clicked", lambda *_: self._save())
         self.revert_btn = Gtk.Button(label="Revert")
         self.revert_btn.connect("clicked", lambda *_: self._populate(self.current))
+        self.duplicate_btn = Gtk.Button(label="Duplicate")
+        self.duplicate_btn.set_tooltip_text(
+            "Clone this launcher to a new .desktop file so you can tweak it "
+            "(name, WMClass, isolated profile…) without touching the original."
+        )
+        self.duplicate_btn.connect("clicked", lambda *_: self._duplicate())
         self.delete_btn = Gtk.Button(label="Delete…")
         self.delete_btn.get_style_context().add_class("destructive-action")
         self.delete_btn.connect("clicked", lambda *_: self._delete())
         self.create_btn = Gtk.Button(label="Create Launcher")
         self.create_btn.connect("clicked", lambda *_: self._create_from_orphan())
+        self.forget_btn = Gtk.Button(label="Forget orphan…")
+        self.forget_btn.set_tooltip_text(
+            "Delete Vivaldi's cached icons for this orphan PWA. Does NOT "
+            "fully uninstall the PWA from Vivaldi — use vivaldi://apps for "
+            "that."
+        )
+        self.forget_btn.connect("clicked", lambda *_: self._forget_orphan())
+        self.vivaldi_apps_btn = Gtk.Button(label="Open vivaldi://apps")
+        self.vivaldi_apps_btn.set_tooltip_text(
+            "Opens Vivaldi's installed-apps page so you can fully uninstall "
+            "a PWA from Vivaldi's registry."
+        )
+        self.vivaldi_apps_btn.connect("clicked",
+                                      lambda *_: self._open_vivaldi_apps())
         btn_row.pack_start(self.launch_btn, False, False, 0)
         btn_row.pack_start(self.save_btn, False, False, 0)
         btn_row.pack_start(self.revert_btn, False, False, 0)
+        btn_row.pack_start(self.duplicate_btn, False, False, 0)
         btn_row.pack_end(self.delete_btn, False, False, 0)
         btn_row.pack_end(self.create_btn, False, False, 0)
+        btn_row.pack_end(self.forget_btn, False, False, 0)
+        btn_row.pack_end(self.vivaldi_apps_btn, False, False, 0)
         right.pack_start(btn_row, False, False, 0)
 
         self.status = Gtk.Statusbar()
@@ -1021,7 +1044,10 @@ class PWAManager(Gtk.Window):
         self.save_btn.set_sensitive(on and not orphan)
         self.revert_btn.set_sensitive(on and not orphan)
         self.delete_btn.set_sensitive(on and not orphan)
+        self.duplicate_btn.set_sensitive(on and not orphan)
         self.create_btn.set_sensitive(on and orphan)
+        self.forget_btn.set_sensitive(on and orphan)
+        self.vivaldi_apps_btn.set_sensitive(True)  # always available
 
     def _update_icon_preview(self):
         pix = load_icon_pixbuf(self.icon_entry.get_text(), self.appid_entry.get_text(), 64)
@@ -1109,34 +1135,51 @@ class PWAManager(Gtk.Window):
             return f"Sandboxed window · {url or '(no URL set)'}"
         return "Vivaldi launcher"
 
-    def _new_sandboxed(self):
-        dlg = Gtk.Dialog(title="New sandboxed launcher",
-                         transient_for=self, modal=True)
+    def _new_launcher(self):
+        dlg = Gtk.Dialog(title="New launcher", transient_for=self, modal=True)
         dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dlg.add_button("Create", Gtk.ResponseType.OK)
         box = dlg.get_content_area()
         box.set_spacing(6); box.set_margin_top(8)
         box.set_margin_start(10); box.set_margin_end(10); box.set_margin_bottom(8)
         grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        kind_combo = Gtk.ComboBoxText()
+        kind_combo.append("sandboxed", "Sandboxed window  (full chrome, isolated profile)")
+        kind_combo.append("webapp", "Web App  (--app=URL, no chrome)")
+        kind_combo.set_active_id("sandboxed")
         name_e = Gtk.Entry(placeholder_text="e.g. Portainer")
         url_e = Gtk.Entry(placeholder_text="https://…")
         icon_e = Gtk.Entry(placeholder_text="Icon name or path (optional)")
-        for r, (lbl, w) in enumerate((("Name", name_e), ("URL", url_e), ("Icon", icon_e))):
+        rows = (("Kind", kind_combo), ("Name", name_e), ("URL", url_e), ("Icon", icon_e))
+        for r, (lbl, w) in enumerate(rows):
             grid.attach(Gtk.Label(label=lbl, xalign=1), 0, r, 1, 1)
             grid.attach(w, 1, r, 1, 1)
             w.set_hexpand(True)
         box.pack_start(grid, False, False, 0)
-        note = Gtk.Label(
-            xalign=0,
-            label="Creates a launcher with its own Chromium profile and WM "
-                  "class, so it appears as a separate app in the panel but "
-                  "keeps full Vivaldi chrome (tabs + address bar).",
-        )
+
+        note = Gtk.Label(xalign=0)
         note.set_line_wrap(True)
         note.get_style_context().add_class("dim-label")
+
+        def update_note(*_):
+            if kind_combo.get_active_id() == "sandboxed":
+                note.set_text(
+                    "Sandboxed: full Vivaldi window (tabs + address bar) with "
+                    "its own Chromium profile and WM class. Pinned as a "
+                    "separate app in the taskbar."
+                )
+            else:
+                note.set_text(
+                    "Web App: chromeless --app=URL window. No tabs, no "
+                    "address bar. Vivaldi has to be installed and on PATH."
+                )
+        update_note()
+        kind_combo.connect("changed", update_note)
         box.pack_start(note, False, False, 0)
+
         dlg.show_all()
         if dlg.run() == Gtk.ResponseType.OK:
+            kind = kind_combo.get_active_id() or "sandboxed"
             name = name_e.get_text().strip()
             url = url_e.get_text().strip()
             icon = icon_e.get_text().strip()
@@ -1144,16 +1187,21 @@ class PWAManager(Gtk.Window):
             if not name or not url:
                 self._error("Name and URL are required.")
                 return
-            self._create_sandboxed(name, url, icon)
+            self._create_new_launcher(kind, name, url, icon)
         else:
             dlg.destroy()
 
-    def _create_sandboxed(self, name, url, icon):
+    def _create_new_launcher(self, kind, name, url, icon):
         slug = re.sub(r"[^A-Za-z0-9]+", "", name) or "VivaldiApp"
+        slug_lower = slug.lower()
+        out = APPS_DIR / f"vivaldi-{kind}-{slug_lower}.desktop"
+        if out.exists():
+            self._error(f"{out.name} already exists.")
+            return
+
         wm_class = slug
-        udd = isolated_profile_path_for(wm_class, "")
-        core = build_core_for_kind("sandboxed", DEFAULT_BINARY, "", url)
-        # Compose full Exec via build_exec so it picks up WMClass + user-data-dir
+        udd = isolated_profile_path_for(wm_class, "") if kind == "sandboxed" else ""
+        core = build_core_for_kind(kind, DEFAULT_BINARY, "", url)
         model = {
             "opaque": False, "user_data_dir": udd,
             "window_state": "default", "window_size": "", "window_position": "",
@@ -1163,12 +1211,9 @@ class PWAManager(Gtk.Window):
             "lang": "", "proxy_server": "",
         }
         exec_line = build_exec(core, model, "", wm_class)
-        ensure_isolated_profile_dir(udd)
-        slug_lower = slug.lower()
-        out = APPS_DIR / f"vivaldi-sandboxed-{slug_lower}.desktop"
-        if out.exists():
-            self._error(f"{out.name} already exists.")
-            return
+        if udd:
+            ensure_isolated_profile_dir(udd)
+
         cp = RawConfigParser(interpolation=None, strict=False)
         cp.optionxform = str
         sec = {
@@ -1193,6 +1238,78 @@ class PWAManager(Gtk.Window):
             return
         self.refresh()
         self._reselect(str(out))
+
+    def _duplicate(self):
+        if not self.current or self.current.get("_orphan"):
+            return
+        src = Path(self.current["path"])
+        # Find a non-clashing destination
+        stem = src.stem
+        base_stem = re.sub(r"-copy(-\d+)?$", "", stem)
+        n = 1
+        while True:
+            suffix = "-copy" if n == 1 else f"-copy-{n}"
+            dst = src.with_name(f"{base_stem}{suffix}.desktop")
+            if not dst.exists():
+                break
+            n += 1
+        # Copy file, then bump the Name= so the user can spot it in menus
+        try:
+            shutil.copyfile(src, dst)
+            os.chmod(dst, os.stat(src).st_mode)
+            d = parse_desktop(dst)
+            if d and "_cp" in d:
+                cp = d["_cp"]
+                sec = cp["Desktop Entry"]
+                orig_name = sec.get("Name", base_stem)
+                sec["Name"] = f"{orig_name} (copy)"
+                write_desktop(dst, cp, d.get("_had_shebang", False))
+            self._update_mime_cache()
+            self._set_status(f"Duplicated → {dst.name}")
+        except Exception as e:
+            self._error(f"Duplicate failed: {e}")
+            return
+        self.refresh()
+        self._reselect(str(dst))
+
+    def _forget_orphan(self):
+        if not self.current or not self.current.get("_orphan"):
+            return
+        app_id = self.current["app_id"]
+        target = MANIFEST_DIR / app_id
+        # Safety: only allow rmtree under MANIFEST_DIR
+        try:
+            target.resolve().relative_to(MANIFEST_DIR.resolve())
+        except (ValueError, OSError):
+            self._error("Refusing to delete a path outside Vivaldi's manifest dir.")
+            return
+        dlg = Gtk.MessageDialog(
+            transient_for=self, message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Forget this orphan PWA?",
+        )
+        dlg.format_secondary_text(
+            f"Deletes {target}\n\n"
+            "This only removes Vivaldi's cached icons. Vivaldi may still have "
+            "the PWA registered (it'll come back as an orphan if so). For a "
+            "proper uninstall, use vivaldi://apps."
+        )
+        if dlg.run() == Gtk.ResponseType.OK:
+            try:
+                shutil.rmtree(target)
+                self._set_status(f"Forgot {app_id}")
+            except Exception as e:
+                self._error(f"Could not delete: {e}")
+            self.refresh()
+        dlg.destroy()
+
+    def _open_vivaldi_apps(self):
+        try:
+            subprocess.Popen([DEFAULT_BINARY, "vivaldi://apps"],
+                             start_new_session=True)
+            self._set_status("Opened vivaldi://apps")
+        except Exception as e:
+            self._error(f"Couldn't launch Vivaldi: {e}")
 
     # ---- actions ----
     def _browse_icon(self, _btn):
