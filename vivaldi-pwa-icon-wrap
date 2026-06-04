@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""vivaldi-pwa-icon-wrap — launch a Vivaldi command, then patch _NET_WM_ICON
+on the resulting window so alt-tab / taskbar show the right icon instead of
+Chromium's default. Helper for vivaldi-pwa-manager. X11 only.
+
+Usage:
+    vivaldi-pwa-icon-wrap <icon-path> <wm-class> -- <command...>
+
+If python-xlib or PyGObject is missing, or the icon can't be loaded, we
+silently fall through to exec(cmd) so a misconfigured environment never
+breaks the user's launcher.
+"""
+
+import array
+import os
+import subprocess
+import sys
+import time
+
+
+def fall_through(cmd):
+    os.execvp(cmd[0], cmd)
+
+
+def load_icon_argb(path, target_size=128):
+    """Return [w, h, *argb_ints] suitable for _NET_WM_ICON, or None."""
+    try:
+        import gi
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+    except Exception:
+        return None
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_size(path, target_size, target_size)
+    except Exception:
+        return None
+    if pb.get_n_channels() != 4:
+        pb = pb.add_alpha(False, 0, 0, 0)
+    w, h = pb.get_width(), pb.get_height()
+    stride = pb.get_rowstride()
+    pixels = pb.get_pixels()
+    out = array.array("I", [w, h])
+    # Pack RGBA bytes → ARGB cardinals, row by row (stride may be > w*4).
+    row_len = w * 4
+    for y in range(h):
+        base = y * stride
+        row = pixels[base:base + row_len]
+        for x in range(0, row_len, 4):
+            r, g, b, a = row[x], row[x + 1], row[x + 2], row[x + 3]
+            out.append((a << 24) | (r << 16) | (g << 8) | b)
+    return out.tolist()
+
+
+def find_windows(display, wm_class):
+    """Return set of window IDs whose WM_CLASS contains wm_class. Walks one
+    level into each top-level (some WMs reparent)."""
+    found = set()
+    root = display.screen().root
+    try:
+        kids = root.query_tree().children
+    except Exception:
+        return found
+    for w in kids:
+        for win in (w, *_safe_children(w)):
+            try:
+                cls = win.get_wm_class()
+            except Exception:
+                cls = None
+            if cls and wm_class in cls:
+                found.add(win.id)
+    return found
+
+
+def _safe_children(win):
+    try:
+        return win.query_tree().children
+    except Exception:
+        return []
+
+
+def apply_icon(display, wid, icon_data):
+    from Xlib import Xatom
+    NET_WM_ICON = display.intern_atom("_NET_WM_ICON")
+    try:
+        w = display.create_resource_object("window", wid)
+        w.change_property(NET_WM_ICON, Xatom.CARDINAL, 32, icon_data)
+        display.sync()
+        return True
+    except Exception:
+        return False
+
+
+def main(argv):
+    if len(argv) < 5 or argv[3] != "--":
+        sys.stderr.write(
+            f"usage: {os.path.basename(argv[0])} "
+            "<icon-path> <wm-class> -- <command...>\n"
+        )
+        return 2
+    icon_path, wm_class, cmd = argv[1], argv[2], argv[4:]
+
+    icon_data = load_icon_argb(icon_path) if os.path.isfile(icon_path) else None
+    try:
+        from Xlib import display as _xdisplay
+    except Exception:
+        fall_through(cmd)
+    if icon_data is None:
+        fall_through(cmd)
+
+    display = _xdisplay.Display()
+    existing = find_windows(display, wm_class)
+
+    proc = subprocess.Popen(cmd)
+
+    # Poll up to ~10 s for a new window of this class. Vivaldi's singleton-IPC
+    # means our spawned process may exit quickly while the actual window is
+    # created by an already-running Vivaldi instance — that's why we identify
+    # the new window by diffing against the snapshot, not by PID.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        current = find_windows(display, wm_class)
+        new = current - existing
+        if new:
+            for wid in new:
+                apply_icon(display, wid, icon_data)
+            break
+        time.sleep(0.1)
+
+    try:
+        return proc.wait()
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

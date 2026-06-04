@@ -17,7 +17,7 @@ Built and tested on Linux Mint Cinnamon. Should be fine anywhere PyGObject + GTK
   - **Web App** — `--app=URL`. No chrome. ICE-style. Quick way to app-ify any URL with no manifest involved.
   - **Sandboxed window** — full Vivaldi window with tabs + address bar + menu, but pinned to its own `--user-data-dir` profile and its own WM class. Looks like a separate app in the taskbar, behaves like a normal browser inside.
 - **Structured form** for the Chromium flags people actually want:
-  - **Window**: maximized / fullscreen / size / position, `SingleMainWindow`
+  - **Window**: maximized / fullscreen / size / position, `SingleMainWindow`, alt-tab icon override (see below)
   - **Profile & privacy**: isolated profile (one-click), incognito, disable-extensions, `--password-store=basic` (silences keyring prompts on Mint)
   - **Appearance & network**: force dark mode, language override, proxy server
   - **Desktop integration**: Categories, Keywords, MimeType, Comment, NoDisplay
@@ -84,6 +84,22 @@ After Save, `update-desktop-database` is called so Cinnamon's menu sees the chan
 | **Web App** (`--app=URL`) | Chromeless app window. No PWA record needed. | Quick app-ifying any URL |
 | **Sandboxed window** | Full Vivaldi window. Separate profile. Separate WM class. | Multi-tab dashboards, two-of-the-same logins (two Slacks, two Gmails, take your pick) |
 
+### Fixing the alt-tab icon (the Vivaldi-icon-on-everything problem)
+
+By default, alt-tab and the panel pull the window's icon from `_NET_WM_ICON`, which Chromium sets to its own logo for `--app=URL` and sandboxed windows (true PWAs *should* set this from the manifest, but it's flaky). The `.desktop` file's `Icon=` only gets consulted by some surfaces, and not by Muffin's alt-tab.
+
+Tick **Override alt-tab / taskbar icon via xseticon wrapper** in the *Window* expander. On Save, the manager:
+
+1. Drops a tiny Python helper at `~/.local/bin/vivaldi-pwa-icon-wrap`
+2. Rewrites the launcher's `Exec` to: `vivaldi-pwa-icon-wrap <Icon> <WMClass> -- <original Exec>`
+3. The helper waits for the new window with that WM class and patches `_NET_WM_ICON` directly via X11
+
+Untick to revert; the manager peels the wrapper back off the next time you Save.
+
+**One dep**: `sudo apt install python3-xlib` (on Fedora: `python3-xlib`; on Arch: `python-xlib`).
+
+**X11 only**. No-op on Wayland — but Cinnamon is X11, so on the target audience this just works. If the helpers are missing at launch time, the wrapper falls through to a plain exec so your launcher never breaks.
+
 ### Isolated profile, in one tick
 
 Check **Isolated profile** in the *Profile & Privacy* expander, hit Save. You get:
@@ -100,6 +116,7 @@ The profile directory is created on Save, but *only* if it sits inside `~/.local
 
 - `~/.local/share/applications/*.desktop` — the launchers
 - `~/.local/share/vivaldi-pwa-profiles/<slug>/` — isolated profile dirs, only when *Isolated profile* is on
+- `~/.local/bin/vivaldi-pwa-icon-wrap` — the icon-override helper, only when *Override alt-tab icon* is on
 
 Nothing else. Vivaldi's profile (`~/.config/vivaldi/`) is read-only as far as this tool is concerned.
 
