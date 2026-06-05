@@ -119,10 +119,16 @@ Vivaldi's profile (`~/.config/vivaldi/`) is read-only as far as this tool is con
 
 ## Known limitations
 
-- **True PWAs don't store their URL in the launcher** — Vivaldi keeps it in a Chromium sqlite DB we don't poke. Converting PWA → Web App / Sandboxed needs you to type the URL.
-- **Shell-wrapped `Exec=sh -c '…'`** lines are left alone — form goes read-only for those.
-- **Cinnamon-tested only.** Other desktops should work (`.desktop` is standard) but pinning / grouping behaviour depends on the desktop.
-- **No flag puts the address bar back in app mode.** That's the entire point of `--app`. Use *Sandboxed window*.
+Tracked as GitHub issues so you can subscribe / comment / +1:
+
+- **[#1](https://github.com/theJamess/vivaldi-pwa-manager/issues/1)** — *Visible on all workspaces (sticky)* doesn't work on Cinnamon/Muffin. EWMH path is dead-on-arrival; right-click → *Always on Visible Workspace* is the only mechanism. Works on KDE / Xfce / Mate / Openbox.
+- **[#2](https://github.com/theJamess/vivaldi-pwa-manager/issues/2)** — True PWAs (`--app-id`) don't store their URL in the launcher. Converting PWA → Web App / Sandboxed needs you to type the URL by hand. Could be auto-recovered from Chromium's sqlite DB.
+- **[#3](https://github.com/theJamess/vivaldi-pwa-manager/issues/3)** — Shell-wrapped `Exec=sh -c '…'` lines force the form into read-only mode (no winners from a tool guessing shell escaping).
+- **[#4](https://github.com/theJamess/vivaldi-pwa-manager/issues/4)** — Cinnamon-tested only. Reports from KDE / GNOME / Xfce / etc. welcome.
+- **[#5](https://github.com/theJamess/vivaldi-pwa-manager/issues/5)** — Wayland: tool itself works, the X11 window-poke features (icon override / sticky) no-op.
+- **[#6](https://github.com/theJamess/vivaldi-pwa-manager/issues/6)** — PWAs at hosts with untrusted certs (UDM-Pro, raw IPMI, lab gear at IPs) crash on *Continue*. `--ignore-certificate-errors` dies on Vivaldi's singleton; the only durable fix is trusting the cert in `vivaldi://certificate-manager` (or the NSS DB).
+
+Permanent design choice, not a bug: **no flag puts the address bar back in `--app` mode.** That's the whole point of `--app`. Use *Sandboxed window* if you want chrome.
 
 ## Contributing
 
