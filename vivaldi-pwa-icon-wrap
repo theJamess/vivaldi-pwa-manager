@@ -100,29 +100,79 @@ def apply_icon(display, wid, icon_data):
 
 
 def apply_sticky(display, wid):
-    """Mark window sticky (visible on all workspaces) via _NET_WM_STATE
-    ClientMessage. ACTION=_NET_WM_STATE_ADD (1)."""
+    """Mark window sticky (visible on all workspaces). Sends BOTH:
+      1. _NET_WM_STATE_STICKY via _NET_WM_STATE ClientMessage (standard EWMH)
+      2. _NET_WM_DESKTOP = 0xFFFFFFFF ClientMessage
+    Belt-and-suspenders so different WMs all get something they can honour.
+
+    Caveat: Cinnamon/Muffin 6.x silently ignores both — Muffin sets the
+    _NET_WM_STATE_STICKY property bit on the window but doesn't actually
+    place the window on all workspaces. There's no client-side EWMH path
+    that triggers Muffin's internal Meta.Window.stick(); the only thing
+    that works on Cinnamon is right-click → Always on Visible Workspace.
+    See README for details. Works fine on KDE/KWin, Xfwm, Marco, Openbox.
+
+    Errors are logged to stderr so misbehaviour shows up in journalctl or
+    the terminal you launched from, rather than silently failing."""
     try:
         from Xlib import X
         from Xlib.protocol.event import ClientMessage
-        NET_WM_STATE = display.intern_atom("_NET_WM_STATE")
-        STICKY = display.intern_atom("_NET_WM_STATE_STICKY")
-        SOURCE_NORMAL_APP = 1
+    except Exception as e:
+        print(f"vivaldi-pwa-icon-wrap: apply_sticky: no Xlib ({e})",
+              file=sys.stderr)
+        return False
+
+    NET_WM_STATE = display.intern_atom("_NET_WM_STATE")
+    STICKY = display.intern_atom("_NET_WM_STATE_STICKY")
+    NET_WM_DESKTOP = display.intern_atom("_NET_WM_DESKTOP")
+    SOURCE_NORMAL_APP = 1
+    ALL_DESKTOPS = 0xFFFFFFFF
+    EVENT_MASK = X.SubstructureRedirectMask | X.SubstructureNotifyMask
+    root = display.screen().root
+
+    try:
         win = display.create_resource_object("window", wid)
+    except Exception as e:
+        print(f"vivaldi-pwa-icon-wrap: apply_sticky: bad window {wid}: {e}",
+              file=sys.stderr)
+        return False
+
+    ok = True
+
+    # 1. _NET_WM_STATE_STICKY (EWMH-standard)
+    try:
         ev = ClientMessage(
             window=win,
             client_type=NET_WM_STATE,
-            # data: action=ADD, prop1=STICKY, prop2=0, source=normal-app, pad
             data=(32, [1, STICKY, 0, SOURCE_NORMAL_APP, 0]),
         )
-        display.screen().root.send_event(
-            ev,
-            event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+        root.send_event(ev, event_mask=EVENT_MASK)
+    except Exception as e:
+        print(f"vivaldi-pwa-icon-wrap: sticky state msg failed: {e}",
+              file=sys.stderr)
+        ok = False
+
+    # 2. _NET_WM_DESKTOP = 0xFFFFFFFF (Muffin / Cinnamon's preferred mechanism)
+    try:
+        ev = ClientMessage(
+            window=win,
+            client_type=NET_WM_DESKTOP,
+            data=(32, [ALL_DESKTOPS, SOURCE_NORMAL_APP, 0, 0, 0]),
         )
+        root.send_event(ev, event_mask=EVENT_MASK)
+    except Exception as e:
+        print(f"vivaldi-pwa-icon-wrap: desktop msg failed: {e}",
+              file=sys.stderr)
+        ok = False
+
+    try:
         display.sync()
-        return True
-    except Exception:
-        return False
+    except Exception as e:
+        print(f"vivaldi-pwa-icon-wrap: display.sync failed: {e}",
+              file=sys.stderr)
+        ok = False
+
+    return ok
 
 
 # ---------- Arg parsing ----------
@@ -209,6 +259,11 @@ def main(argv):
         current = find_windows(display, wm_class)
         new = current - existing
         if new:
+            # Give the WM a beat to finish managing the new window before
+            # sending it state-change ClientMessages. Without this, Muffin
+            # in particular can ignore the sticky / desktop message because
+            # the window isn't yet in its managed-window list.
+            time.sleep(0.3)
             for wid in new:
                 if wants_icon:
                     apply_icon(display, wid, icon_data)

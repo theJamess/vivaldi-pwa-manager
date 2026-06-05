@@ -77,6 +77,14 @@ Cinnamon's alt-tab uses `_NET_WM_ICON`, which Chromium sets to its own logo for 
 
 Tick **Override alt-tab / taskbar icon via xseticon wrapper** in the *Window* expander. On Save the manager installs `~/.local/bin/vivaldi-pwa-icon-wrap` (a small python-xlib helper) and rewraps the Exec so the helper patches `_NET_WM_ICON` after the window appears. Untick to revert. X11 only (Cinnamon is X11). Needs `python3-xlib`. Falls through to a plain exec if the helper / deps are missing — never breaks your launcher.
 
+### "Visible on all workspaces" — known broken on Cinnamon
+
+The *Window* expander has a **Visible on all workspaces (sticky)** checkbox that asks the wrapper helper to set `_NET_WM_STATE_STICKY` + `_NET_WM_DESKTOP=0xFFFFFFFF` on the new window. Works on EWMH-compliant WMs (KDE/KWin, Xfwm, Mate's Marco, Openbox).
+
+**Doesn't work on Cinnamon/Muffin 6.x.** Muffin sets the state-property bit but doesn't actually pin the window — verified across `wmctrl -b add,sticky`, `wmctrl -t -1`, `libwnck.Window.pin()`, and our own ClientMessages with both `SOURCE=normal-app` and `SOURCE=pager`. None of them trip Muffin's internal `Meta.Window.stick()`. The only way is right-click → **Always on Visible Workspace** after launch, or set a keybinding for `org.cinnamon.desktop.keybindings.wm toggle-on-all-workspaces` and hit it manually.
+
+If/when Muffin grows back a working client-app sticky path, the checkbox will start working with no other changes.
+
 ### Isolated profile in one tick
 
 *Profile & Privacy* expander → **Isolated profile** → Save. Sets `--user-data-dir=$HOME/.local/share/vivaldi-pwa-profiles/<wmclass-slug>` and `mkdir -p`'s the dir on first save (only inside our managed root — never arbitrary user-typed paths). Run two of the same app signed in to different accounts and they don't see each other.

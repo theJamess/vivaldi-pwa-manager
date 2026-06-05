@@ -1258,9 +1258,13 @@ class PWAManager(Gtk.Window):
         self.cb_sticky = Gtk.CheckButton(
             label="Visible on all workspaces (sticky)")
         self.cb_sticky.set_tooltip_text(
-            "After launch, set _NET_WM_STATE_STICKY so the window appears on "
-            "every Cinnamon workspace. Shares the same helper as the icon "
-            "override — needs python3-xlib. X11 only."
+            "After launch, ask the WM to make the window appear on every "
+            "workspace. Works on EWMH-compliant WMs (KDE/KWin, Xfwm, Mate's "
+            "Marco, Openbox, …). KNOWN-BROKEN on Cinnamon/Muffin 6.x — Muffin "
+            "sets the property bit but ignores client-app sticky requests. "
+            "Manual workaround on Cinnamon: right-click the window's title "
+            "bar → Always on Visible Workspace. Shares the helper with the "
+            "icon override; needs python3-xlib."
         )
         win_box.pack_start(self.cb_sticky, False, False, 0)
 
@@ -2859,14 +2863,30 @@ class PWAManager(Gtk.Window):
         }
 
     def _rewrite_url_in_core(self, core: str) -> str:
+        """Apply the form's URL field to the core Exec.
+
+        - Webapp (--app=URL present): replace or — if URL field is empty —
+          strip the --app= token entirely.
+        - Sandboxed (positional URL present): replace or strip.
+        - Neither (PWA via --app-id): leave alone.
+        Whitespace is normalised after a strip so we don't leave double spaces.
+        """
         new_url = self.url_entry.get_text().strip()
-        if not new_url:
-            return core
         if APP_URL_RE.search(core):
-            return APP_URL_RE.sub(f'--app="{new_url}"', core, count=1)
-        if POSITIONAL_URL_RE.search(core):
-            return POSITIONAL_URL_RE.sub(new_url, core, count=1)
-        return core  # don't inject into --app-id launchers
+            if new_url:
+                core = APP_URL_RE.sub(f'--app="{new_url}"', core, count=1)
+            else:
+                core = APP_URL_RE.sub("", core, count=1)
+        elif POSITIONAL_URL_RE.search(core):
+            if new_url:
+                core = POSITIONAL_URL_RE.sub(new_url, core, count=1)
+            else:
+                core = POSITIONAL_URL_RE.sub("", core, count=1)
+        try:
+            tokens = shlex.split(core)
+            return " ".join(_quote_token(t) for t in tokens)
+        except ValueError:
+            return " ".join(core.split())
 
     def _save(self):
         if not self.current or self.current.get("_orphan"):
